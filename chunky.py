@@ -726,7 +726,12 @@ class SimpleChunkedModelWithCheckpoints:
                 print(f"🎯 Starting new generation: '{prompt[:50]}...'")
             
             # Tokenize and embed
-            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(self.device)
+            #inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(self.device)
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=False)
+            if inputs["input_ids"].shape[1] > 4000:  # Use model's actual limit
+                print(f"⚠️  Input too long, truncating to 4000 tokens")
+                inputs["input_ids"] = inputs["input_ids"][:, -4000:]
+            
             input_ids = inputs["input_ids"]
             
             embed_weights = self.get_embedding_weights()
