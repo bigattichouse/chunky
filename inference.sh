@@ -3,9 +3,9 @@ clear
 #Qwen/Qwen3-32B
 python chunky.py \
   --model Qwen/Qwen3-32B
-  --vram 3.5 \
+  --vram 5 \
   --chunk-layers 2 \
-  --prompt "Write a detailed 1000-word essay about quantum computing and its applications" \
+  --prompt "Write a linux commandline tetris program in C." \
   --tokens 1000 \
   --checkpoint-every 25 \
   --checkpoint-name quantum_essay \
