@@ -2,7 +2,7 @@
 """
 Chunked Inference with Full Checkpoint/Resume System + Performance Optimizations
 Enables safe long-form generation with progress saving and resumption
-Now with KV caching, weight caching, quantization, torch.compile, and other speed optimizations
+Now with KV caching, weight caching, quantization, and other speed optimizations
 """
 
 import os
@@ -59,41 +59,6 @@ class GenerationCheckpoint:
     # Performance stats
     total_chunks_processed: int = 0
     average_chunk_time: float = 0.0
-
-
-# =============================================================================
-# TORCH.COMPILE OPTIMIZATION WRAPPER
-# =============================================================================
-
-def get_compiled_function(func, quiet=False):
-    """
-    Safely compile function with torch.compile if PyTorch 2.0+ available
-    Falls back gracefully for older PyTorch versions
-    """
-    try:
-        # Check if torch.compile is available (PyTorch 2.0+)
-        if hasattr(torch, 'compile'):
-            # Additional version check to be safe
-            version_parts = torch.__version__.split('.')
-            major_version = int(version_parts[0])
-            
-            if major_version >= 2:
-                if not quiet:
-                    print(f"🚀 torch.compile available - JIT compiling {func.__name__} for 2-5x speedup!")
-                return torch.compile(func)
-            else:
-                if not quiet:
-                    print(f"⚠️  PyTorch {torch.__version__} detected - torch.compile requires 2.0+")
-                return func
-        else:
-            if not quiet:
-                print(f"⚠️  torch.compile not available in this PyTorch version")
-            return func
-            
-    except Exception as e:
-        if not quiet:
-            print(f"⚠️  torch.compile setup failed: {e}, using standard function")
-        return func
 
 
 # =============================================================================
@@ -503,10 +468,6 @@ class OptimizedChunkedModelWithCheckpoints:
             self.weight_cache = None
             self.enable_quantization = False
         
-        # Compiled functions for speed (will be set up after init)
-        self.compiled_layer_processor = None
-        self.compiled_attention = None
-        
         # Performance tracking
         self.generation_start_time = 0.0
         self.tokens_generated = 0
@@ -543,22 +504,10 @@ class OptimizedChunkedModelWithCheckpoints:
                 print(f"     - Weight Caching: ✅")
                 print(f"     - INT8 Quantization: ✅")
                 print(f"     - Optimized Attention: ✅")
-                print(f"     - torch.compile: {'✅' if hasattr(torch, 'compile') else '❌'}")
             print(f"   Checkpoint directory: {checkpoint_dir}")
             
             estimated_chunks = 80 // self.max_layers_in_vram
             print(f"   Expected chunks per token: ~{estimated_chunks}")
-    
-    def _setup_compiled_functions(self):
-        """Set up torch.compile optimized functions"""
-        if self.enable_optimizations:
-            # Compile the most performance-critical functions
-            self.compiled_layer_processor = get_compiled_function(
-                self._process_layer_chunk_core, quiet=self.quiet
-            )
-            self.compiled_attention = get_compiled_function(
-                self._simple_attention_core, quiet=self.quiet
-            )
     
     def estimate_context_memory(self, sequence_length: int) -> float:
         """Estimate VRAM usage for given context length"""
@@ -654,9 +603,6 @@ class OptimizedChunkedModelWithCheckpoints:
                 self.kv_cache.num_layers = self.config.num_hidden_layers
                 self.kv_cache.num_heads = getattr(self.config, 'num_attention_heads', 32)
                 self.kv_cache.head_dim = getattr(self.config, 'hidden_size', 4096) // self.kv_cache.num_heads
-            
-            # Set up compiled functions after config is loaded
-            self._setup_compiled_functions()
             
             if not self.quiet:
                 print(f"   Model type: {self.config.model_type}")
@@ -1056,16 +1002,24 @@ class OptimizedChunkedModelWithCheckpoints:
         
         return loaded_layers > 0
     
-    def _simple_attention_core(self, hidden_states: torch.Tensor, weights: Dict[str, torch.Tensor],
-                              layer_idx: int, use_kv_cache: bool = True) -> torch.Tensor:
-        """Core attention computation - separated for torch.compile"""
+    def simple_attention_optimized(self, hidden_states: torch.Tensor, layer_idx: int, 
+                                 use_kv_cache: bool = True, verbose: bool = True) -> torch.Tensor:
+        """Optimized Grouped Query Attention computation with KV caching"""
+        if layer_idx not in self.layer_weights:
+            return hidden_states
+        
+        weights = self.layer_weights[layer_idx]
+        
+        q_key = f"model.layers.{layer_idx}.self_attn.q_proj.weight"
+        k_key = f"model.layers.{layer_idx}.self_attn.k_proj.weight"
+        v_key = f"model.layers.{layer_idx}.self_attn.v_proj.weight"
+        o_key = f"model.layers.{layer_idx}.self_attn.o_proj.weight"
+        
+        if not all(key in weights for key in [q_key, k_key, v_key, o_key]):
+            return hidden_states
+        
         try:
             batch_size, seq_len, hidden_size = hidden_states.shape
-            
-            q_key = f"model.layers.{layer_idx}.self_attn.q_proj.weight"
-            k_key = f"model.layers.{layer_idx}.self_attn.k_proj.weight"
-            v_key = f"model.layers.{layer_idx}.self_attn.v_proj.weight"
-            o_key = f"model.layers.{layer_idx}.self_attn.o_proj.weight"
             
             q_weight = weights[q_key]
             k_weight = weights[k_key]
@@ -1088,76 +1042,33 @@ class OptimizedChunkedModelWithCheckpoints:
             k = k.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
             v = v.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
             
+            # Handle KV caching for generation
+            if use_kv_cache and self.kv_cache and seq_len == 1 and self.kv_cache.seq_len > 0:
+                # Get cached K, V
+                cached_k, cached_v = self.kv_cache.get_kv(layer_idx)
+                if cached_k is not None and cached_v is not None:
+                    # Concatenate new K, V with cached
+                    k = torch.cat([cached_k, k], dim=2)
+                    v = torch.cat([cached_v, v], dim=2)
+                
+                # Store updated K, V in cache
+                self.kv_cache.store_kv(layer_idx, k, v)
+            elif use_kv_cache and self.kv_cache:
+                # Store K, V in cache for first time or full sequence
+                self.kv_cache.store_kv(layer_idx, k, v)
+            
             # Handle GQA (Grouped Query Attention)
             if num_kv_heads < num_q_heads:
                 repeat_factor = num_q_heads // num_kv_heads
                 k = k.repeat_interleave(repeat_factor, dim=1)
                 v = v.repeat_interleave(repeat_factor, dim=1)
             
-            # Use optimized attention
+            # Use optimized attention if available
             context = optimized_attention(q, k, v, is_causal=True)
             
             # Reshape and apply output projection
             context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_size)
             output = F.linear(context, weights[o_key])
-            
-            return output
-            
-        except Exception as e:
-            return hidden_states
-    
-    def simple_attention_optimized(self, hidden_states: torch.Tensor, layer_idx: int, 
-                                 use_kv_cache: bool = True, verbose: bool = True) -> torch.Tensor:
-        """Optimized Grouped Query Attention computation with KV caching and compilation"""
-        if layer_idx not in self.layer_weights:
-            return hidden_states
-        
-        weights = self.layer_weights[layer_idx]
-        
-        q_key = f"model.layers.{layer_idx}.self_attn.q_proj.weight"
-        k_key = f"model.layers.{layer_idx}.self_attn.k_proj.weight"
-        v_key = f"model.layers.{layer_idx}.self_attn.v_proj.weight"
-        o_key = f"model.layers.{layer_idx}.self_attn.o_proj.weight"
-        
-        if not all(key in weights for key in [q_key, k_key, v_key, o_key]):
-            return hidden_states
-        
-        try:
-            batch_size, seq_len, hidden_size = hidden_states.shape
-            
-            # Handle KV caching for generation (this part can't be compiled due to cache mutations)
-            cached_k, cached_v = None, None
-            if use_kv_cache and self.kv_cache and seq_len == 1 and self.kv_cache.seq_len > 0:
-                cached_k, cached_v = self.kv_cache.get_kv(layer_idx)
-            
-            # Use compiled core attention function if available
-            if self.compiled_attention:
-                output = self.compiled_attention(hidden_states, weights, layer_idx, use_kv_cache)
-            else:
-                output = self._simple_attention_core(hidden_states, weights, layer_idx, use_kv_cache)
-            
-            # Handle KV cache updates (post-computation)
-            if use_kv_cache and self.kv_cache:
-                # Re-compute K,V for caching (this is a simplification)
-                q_weight = weights[q_key]
-                k_weight = weights[k_key]
-                v_weight = weights[v_key]
-                
-                k = F.linear(hidden_states, k_weight)
-                v = F.linear(hidden_states, v_weight)
-                
-                num_q_heads = getattr(self.config, 'num_attention_heads', 64)
-                head_dim = hidden_size // num_q_heads
-                num_kv_heads = k_weight.shape[0] // head_dim
-                
-                k = k.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
-                v = v.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
-                
-                if cached_k is not None and cached_v is not None:
-                    k = torch.cat([cached_k, k], dim=2)
-                    v = torch.cat([cached_v, v], dim=2)
-                
-                self.kv_cache.store_kv(layer_idx, k, v)
             
             return output
             
@@ -1192,90 +1103,9 @@ class OptimizedChunkedModelWithCheckpoints:
                 print(f"   Error in MLP for layer {layer_idx}: {e}")
             return hidden_states
     
-    def _process_layer_chunk_core(self, hidden_states: torch.Tensor, start_layer: int, 
-                                end_layer: int, layer_weights_dict: Dict) -> torch.Tensor:
-        """Core layer processing logic - separated for torch.compile"""
-        current_states = hidden_states
-        
-        for layer_idx in range(start_layer, end_layer + 1):
-            if layer_idx not in layer_weights_dict:
-                continue
-            
-            weights = layer_weights_dict[layer_idx]
-            residual = current_states
-            
-            # Layer norm
-            ln_key = f"model.layers.{layer_idx}.input_layernorm.weight"
-            if ln_key in weights:
-                try:
-                    ln_weight = weights[ln_key]
-                    current_states = F.layer_norm(current_states, (current_states.size(-1),), ln_weight)
-                except Exception:
-                    pass
-            
-            # Attention (simplified for compilation)
-            try:
-                q_key = f"model.layers.{layer_idx}.self_attn.q_proj.weight"
-                k_key = f"model.layers.{layer_idx}.self_attn.k_proj.weight"
-                v_key = f"model.layers.{layer_idx}.self_attn.v_proj.weight"
-                o_key = f"model.layers.{layer_idx}.self_attn.o_proj.weight"
-                
-                if all(key in weights for key in [q_key, k_key, v_key, o_key]):
-                    batch_size, seq_len, hidden_size = current_states.shape
-                    
-                    q = F.linear(current_states, weights[q_key])
-                    k = F.linear(current_states, weights[k_key])
-                    v = F.linear(current_states, weights[v_key])
-                    
-                    # Simple attention computation (optimized for compilation)
-                    scale = (hidden_size // 32) ** -0.5  # Assume 32 heads
-                    attn = torch.matmul(q, k.transpose(-1, -2)) * scale
-                    attn = F.softmax(attn, dim=-1)
-                    attn_output = torch.matmul(attn, v)
-                    attn_output = F.linear(attn_output, weights[o_key])
-                    
-                    current_states = residual + attn_output
-            except Exception:
-                pass
-            
-            # Post attention layer norm and MLP
-            residual = current_states
-            post_ln_key = f"model.layers.{layer_idx}.post_attention_layernorm.weight"
-            if post_ln_key in weights:
-                try:
-                    post_ln_weight = weights[post_ln_key]
-                    current_states = F.layer_norm(current_states, (current_states.size(-1),), post_ln_weight)
-                except Exception:
-                    pass
-            
-            # MLP
-            gate_key = f"model.layers.{layer_idx}.mlp.gate_proj.weight"
-            up_key = f"model.layers.{layer_idx}.mlp.up_proj.weight"
-            down_key = f"model.layers.{layer_idx}.mlp.down_proj.weight"
-            
-            if all(key in weights for key in [gate_key, up_key, down_key]):
-                try:
-                    gate = F.linear(current_states, weights[gate_key])
-                    up = F.linear(current_states, weights[up_key])
-                    gate = gate * torch.sigmoid(gate)  # SwiGLU
-                    intermediate = gate * up
-                    mlp_output = F.linear(intermediate, weights[down_key])
-                    current_states = residual + mlp_output
-                except Exception:
-                    pass
-        
-        return current_states
-    
     def process_layer_chunk_optimized(self, hidden_states: torch.Tensor, start_layer: int, 
                                     end_layer: int, use_kv_cache: bool = True, verbose: bool = True) -> torch.Tensor:
         """Process hidden states through a chunk of layers with optimizations"""
-        
-        # Use compiled version if available for significant speedup
-        if self.compiled_layer_processor and not use_kv_cache:
-            # For compiled version, we need to pass weights as a regular dict
-            return self.compiled_layer_processor(hidden_states, start_layer, end_layer, self.layer_weights)
-        
-        # Fallback to non-compiled version with full KV cache support
         current_states = hidden_states
         
         for layer_idx in range(start_layer, end_layer + 1):
@@ -1450,8 +1280,7 @@ class OptimizedChunkedModelWithCheckpoints:
                 progress = int((chunk_idx / total_chunks) * 100)
                 dots = "." * (progress // 5)
                 cache_indicator = "🔥" if use_kv_cache else "❄️"
-                compile_indicator = "⚡" if self.compiled_layer_processor else "🐌"
-                print(f"\rToken {token_idx + 1}/{max_tokens}: Processing ({progress:3d}%) {dots:<20} [Chunk {chunk_idx + 1}/{total_chunks}] {cache_indicator}{compile_indicator}", end="", flush=True)
+                print(f"\rToken {token_idx + 1}/{max_tokens}: Processing ({progress:3d}%) {dots:<20} [Chunk {chunk_idx + 1}/{total_chunks}] {cache_indicator}", end="", flush=True)
                 
                 # Move states to GPU for processing
                 if self.keep_embeddings_on_cpu and current_states.device == torch.device('cpu'):
@@ -1473,8 +1302,7 @@ class OptimizedChunkedModelWithCheckpoints:
             
             # Complete progress
             cache_indicator = "🔥" if use_kv_cache else "❄️"
-            compile_indicator = "⚡" if self.compiled_layer_processor else "🐌"
-            print(f"\rToken {token_idx + 1}/{max_tokens}: Processing (100%) .................... [Chunk {total_chunks}/{total_chunks}] {cache_indicator}{compile_indicator} ✓", end="", flush=True)
+            print(f"\rToken {token_idx + 1}/{max_tokens}: Processing (100%) .................... [Chunk {total_chunks}/{total_chunks}] {cache_indicator} ✓", end="", flush=True)
             
             # Ensure final states are on GPU for token generation
             if current_states.device == torch.device('cpu'):
@@ -1574,7 +1402,7 @@ def main():
     """Main application with checkpoint support and optimizations"""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Optimized Chunked Inference with Checkpoint Support + torch.compile")
+    parser = argparse.ArgumentParser(description="Optimized Chunked Inference with Checkpoint Support")
     parser.add_argument("--model", required=True, help="Model path or HuggingFace model name")
     parser.add_argument("--vram", type=float, default=4.0, help="Max VRAM in GB")
     parser.add_argument("--prompt", default="The future of AI is", help="Generation prompt")
@@ -1590,7 +1418,6 @@ def main():
     parser.add_argument("--no-kv-cache", action="store_true", help="Disable KV caching")
     parser.add_argument("--no-weight-cache", action="store_true", help="Disable weight caching")
     parser.add_argument("--no-quantization", action="store_true", help="Disable INT8 quantization")
-    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile JIT compilation")
     
     # Checkpoint arguments
     parser.add_argument("--checkpoint-every", type=int, default=10, help="Save checkpoint every N tokens")
@@ -1662,13 +1489,6 @@ def main():
         if not args.quiet:
             print("⚠️  Quantization disabled")
     
-    if args.no_compile:
-        # Disable compilation by setting compiled functions to None
-        model.compiled_layer_processor = None
-        model.compiled_attention = None
-        if not args.quiet:
-            print("⚠️  torch.compile disabled")
-    
     try:
         # Initialize
         if not model.load_tokenizer_and_config():
@@ -1717,8 +1537,6 @@ def main():
                     optimizations_used.append("Weight Cache")
                 if model.enable_quantization:
                     optimizations_used.append("INT8 Quantization")
-                if model.compiled_layer_processor or model.compiled_attention:
-                    optimizations_used.append("torch.compile")
                 
                 if optimizations_used:
                     print(f"⚡ Optimizations used: {', '.join(optimizations_used)}")
