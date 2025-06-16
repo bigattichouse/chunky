@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Chunked Inference with Full Checkpoint/Resume System
+Chunked Inference with Full Checkpoint/Resume System + Performance Optimizations
 Enables safe long-form generation with progress saving and resumption
+Now with KV caching, weight caching, quantization, and other speed optimizations
 """
 
 import os
@@ -58,6 +59,182 @@ class GenerationCheckpoint:
     # Performance stats
     total_chunks_processed: int = 0
     average_chunk_time: float = 0.0
+
+
+# =============================================================================
+# PERFORMANCE OPTIMIZATION CLASSES
+# =============================================================================
+
+class KVCache:
+    """Key-Value cache for attention layers - Massive speedup for generation"""
+    def __init__(self, max_seq_len=2048, num_layers=32, num_heads=32, head_dim=128, device="cuda"):
+        self.max_seq_len = max_seq_len
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.device = device
+        self.cache = {}  # layer_idx -> {'k': tensor, 'v': tensor}
+        self.seq_len = 0  # Current sequence length
+        
+    def get_kv(self, layer_idx):
+        """Get cached K,V for layer"""
+        if layer_idx not in self.cache:
+            return None, None
+        cache_data = self.cache[layer_idx]
+        return cache_data.get('k'), cache_data.get('v')
+    
+    def store_kv(self, layer_idx, k, v):
+        """Store K,V for layer"""
+        if layer_idx not in self.cache:
+            self.cache[layer_idx] = {}
+        
+        # Store only up to current sequence length
+        if k is not None and v is not None:
+            self.cache[layer_idx]['k'] = k[:, :, :self.seq_len+1, :].clone()
+            self.cache[layer_idx]['v'] = v[:, :, :self.seq_len+1, :].clone()
+    
+    def extend_sequence(self):
+        """Increment sequence length counter"""
+        self.seq_len += 1
+    
+    def reset(self):
+        """Clear cache and reset sequence length"""
+        self.cache.clear()
+        self.seq_len = 0
+    
+    def trim_to_length(self, new_length):
+        """Trim cache to specific length"""
+        self.seq_len = new_length
+        for layer_idx in self.cache:
+            if 'k' in self.cache[layer_idx]:
+                self.cache[layer_idx]['k'] = self.cache[layer_idx]['k'][:, :, :new_length, :]
+            if 'v' in self.cache[layer_idx]:
+                self.cache[layer_idx]['v'] = self.cache[layer_idx]['v'][:, :, :new_length, :]
+
+
+class PersistentWeightCache:
+    """Keep frequently used layer weights in memory between tokens"""
+    def __init__(self, max_cache_size_gb=2.0):
+        self.max_cache_size = max_cache_size_gb * 1024**3  # Convert to bytes
+        self.cache = {}  # layer_idx -> weights
+        self.usage_stats = {}  # layer_idx -> last_used_time
+        self.current_size = 0
+        
+    def get_layer(self, layer_idx):
+        """Get layer weights from cache"""
+        if layer_idx in self.cache:
+            self.usage_stats[layer_idx] = time.time()
+            return self.cache[layer_idx]
+        return None
+    
+    def store_layer(self, layer_idx, weights):
+        """Store layer weights in cache with LRU eviction"""
+        if not weights:
+            return
+            
+        layer_size = self._calculate_size(weights)
+        
+        # Evict old layers if needed
+        while self.current_size + layer_size > self.max_cache_size and self.cache:
+            self._evict_lru_layer()
+        
+        self.cache[layer_idx] = weights
+        self.usage_stats[layer_idx] = time.time()
+        self.current_size += layer_size
+    
+    def _calculate_size(self, weights):
+        """Calculate memory size of weights dict"""
+        total_size = 0
+        for w in weights.values():
+            if hasattr(w, 'numel') and hasattr(w, 'element_size'):
+                total_size += w.numel() * w.element_size()
+        return total_size
+    
+    def _evict_lru_layer(self):
+        """Evict least recently used layer"""
+        if not self.usage_stats:
+            return
+        lru_layer = min(self.usage_stats.keys(), key=lambda x: self.usage_stats[x])
+        self._remove_layer(lru_layer)
+    
+    def _remove_layer(self, layer_idx):
+        """Remove layer from cache"""
+        if layer_idx in self.cache:
+            weights = self.cache[layer_idx]
+            layer_size = self._calculate_size(weights)
+            del self.cache[layer_idx]
+            del self.usage_stats[layer_idx]
+            self.current_size -= layer_size
+    
+    def clear(self):
+        """Clear all cached weights"""
+        self.cache.clear()
+        self.usage_stats.clear()
+        self.current_size = 0
+
+
+def quantize_weights_int8(weights):
+    """Quantize FP16 weights to INT8 for memory efficiency"""
+    quantized = {}
+    for name, tensor in weights.items():
+        if hasattr(tensor, 'dtype') and tensor.dtype in [torch.float16, torch.float32]:
+            # Simple linear quantization
+            min_val, max_val = tensor.min().item(), tensor.max().item()
+            if abs(max_val - min_val) < 1e-8:  # Avoid division by zero
+                quantized[name] = tensor.half()
+                continue
+                
+            scale = (max_val - min_val) / 255.0
+            zero_point = int((-min_val / scale + 0.5))
+            zero_point = max(0, min(255, zero_point))
+            
+            quantized_tensor = torch.clamp(torch.round((tensor - min_val) / scale), 0, 255).byte()
+            quantized[name] = {
+                'weight': quantized_tensor,
+                'scale': scale,
+                'zero_point': zero_point,
+                'min_val': min_val,
+                'max_val': max_val
+            }
+        else:
+            quantized[name] = tensor
+    return quantized
+
+
+def dequantize_weights_int8(quantized_weights):
+    """Dequantize INT8 weights back to FP16 for computation"""
+    weights = {}
+    for name, data in quantized_weights.items():
+        if isinstance(data, dict) and 'weight' in data:
+            # Dequantize
+            quantized_tensor = data['weight']
+            scale = data['scale']
+            min_val = data['min_val']
+            weights[name] = (quantized_tensor.float() * scale + min_val).half()
+        else:
+            weights[name] = data
+    return weights
+
+
+def optimized_attention(q, k, v, is_causal=True):
+    """Use PyTorch's optimized attention implementation when available"""
+    try:
+        # Use built-in Flash Attention if available (PyTorch 2.0+)
+        return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+    except (AttributeError, RuntimeError):
+        # Fallback to manual implementation
+        scale = q.size(-1) ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        
+        if is_causal:
+            # Apply causal mask
+            seq_len_q, seq_len_k = q.size(-2), k.size(-2)
+            if seq_len_q > 1 or seq_len_k > 1:  # Only apply mask if we have multiple tokens
+                causal_mask = torch.triu(torch.ones(seq_len_q, seq_len_k, device=q.device), diagonal=1).bool()
+                attn = attn.masked_fill(causal_mask, float('-inf'))
+        
+        attn = F.softmax(attn, dim=-1)
+        return torch.matmul(attn, v)
 
 
 class CheckpointManager:
@@ -256,18 +433,19 @@ class CheckpointManager:
         print(f"✅ Removed {removed_count} old checkpoint(s)")
 
 
-class SimpleChunkedModelWithCheckpoints:
-    """Enhanced chunked model with full checkpoint support"""
+class OptimizedChunkedModelWithCheckpoints:
+    """Enhanced chunked model with full checkpoint support + performance optimizations"""
     
     def __init__(self, model_path: str, max_vram_gb: float = 4.0, temperature: float = 0.7, 
                  quiet: bool = False, chunk_layers: int = None, checkpoint_dir: str = "./checkpoints",
-                 max_context_length: int = None):
+                 max_context_length: int = None, enable_optimizations: bool = True):
         self.model_path = model_path
         self.max_vram_gb = max_vram_gb
         self.temperature = temperature
         self.quiet = quiet
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.max_context_length = max_context_length  # User override
+        self.enable_optimizations = enable_optimizations
         
         # Checkpoint manager
         self.checkpoint_manager = CheckpointManager(checkpoint_dir)
@@ -279,6 +457,16 @@ class SimpleChunkedModelWithCheckpoints:
         self.layer_weights = {}
         self.embedding_weights = None
         self.lm_head_weights = None
+        
+        # Performance optimizations
+        if self.enable_optimizations:
+            self.kv_cache = KVCache(device=self.device)
+            self.weight_cache = PersistentWeightCache(max_cache_size_gb=2.0)
+            self.enable_quantization = True
+        else:
+            self.kv_cache = None
+            self.weight_cache = None
+            self.enable_quantization = False
         
         # Performance tracking
         self.generation_start_time = 0.0
@@ -303,13 +491,19 @@ class SimpleChunkedModelWithCheckpoints:
         self.max_layers_in_vram = chunk_layers if chunk_layers is not None else default_layers
         
         if not self.quiet:
-            print(f"🚀 Initializing chunked model with checkpoint support")
+            print(f"🚀 Initializing optimized chunked model with checkpoint support")
             print(f"   Model: {model_path}")
             print(f"   VRAM limit: {max_vram_gb}GB")
             print(f"   Device: {self.device}")
             print(f"   Precision: {self.dtype}")
             print(f"   Max layers per chunk: {self.max_layers_in_vram}")
             print(f"   CPU offloading: {self.keep_embeddings_on_cpu}")
+            print(f"   Optimizations: {'Enabled' if enable_optimizations else 'Disabled'}")
+            if enable_optimizations:
+                print(f"     - KV Caching: ✅")
+                print(f"     - Weight Caching: ✅")
+                print(f"     - INT8 Quantization: ✅")
+                print(f"     - Optimized Attention: ✅")
             print(f"   Checkpoint directory: {checkpoint_dir}")
             
             estimated_chunks = 80 // self.max_layers_in_vram
@@ -403,6 +597,12 @@ class SimpleChunkedModelWithCheckpoints:
             
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            # Initialize KV cache with correct dimensions
+            if self.kv_cache and hasattr(self.config, 'num_hidden_layers'):
+                self.kv_cache.num_layers = self.config.num_hidden_layers
+                self.kv_cache.num_heads = getattr(self.config, 'num_attention_heads', 32)
+                self.kv_cache.head_dim = getattr(self.config, 'hidden_size', 4096) // self.kv_cache.num_heads
             
             if not self.quiet:
                 print(f"   Model type: {self.config.model_type}")
@@ -518,7 +718,16 @@ class SimpleChunkedModelWithCheckpoints:
         return True
     
     def get_layer_weights(self, layer_idx: int) -> Dict[str, torch.Tensor]:
-        """Load specific layer weights from safetensor files"""
+        """Load specific layer weights from safetensor files with optimization"""
+        # Check weight cache first
+        if self.weight_cache:
+            cached_weights = self.weight_cache.get_layer(layer_idx)
+            if cached_weights is not None:
+                # Dequantize if needed
+                if self.enable_quantization:
+                    return dequantize_weights_int8(cached_weights)
+                return cached_weights
+        
         layer_weights = {}
         
         layer_patterns = [
@@ -544,6 +753,11 @@ class SimpleChunkedModelWithCheckpoints:
                 if not self.quiet:
                     print(f"   Warning: Could not read {file_path.name}: {e}")
                 continue
+        
+        # Cache weights (quantized if enabled)
+        if self.weight_cache and layer_weights:
+            weights_to_cache = quantize_weights_int8(layer_weights) if self.enable_quantization else layer_weights
+            self.weight_cache.store_layer(layer_idx, weights_to_cache)
         
         return layer_weights
     
@@ -788,8 +1002,9 @@ class SimpleChunkedModelWithCheckpoints:
         
         return loaded_layers > 0
     
-    def simple_attention(self, hidden_states: torch.Tensor, layer_idx: int, verbose: bool = True) -> torch.Tensor:
-        """Grouped Query Attention computation"""
+    def simple_attention_optimized(self, hidden_states: torch.Tensor, layer_idx: int, 
+                                 use_kv_cache: bool = True, verbose: bool = True) -> torch.Tensor:
+        """Optimized Grouped Query Attention computation with KV caching"""
         if layer_idx not in self.layer_weights:
             return hidden_states
         
@@ -817,23 +1032,41 @@ class SimpleChunkedModelWithCheckpoints:
             head_dim = hidden_size // num_q_heads
             num_kv_heads = k_size // head_dim
             
+            # Compute Q, K, V
             q = F.linear(hidden_states, q_weight)
             k = F.linear(hidden_states, k_weight)
             v = F.linear(hidden_states, v_weight)
             
+            # Reshape for attention
             q = q.view(batch_size, seq_len, num_q_heads, head_dim).transpose(1, 2)
             k = k.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
             v = v.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
             
+            # Handle KV caching for generation
+            if use_kv_cache and self.kv_cache and seq_len == 1 and self.kv_cache.seq_len > 0:
+                # Get cached K, V
+                cached_k, cached_v = self.kv_cache.get_kv(layer_idx)
+                if cached_k is not None and cached_v is not None:
+                    # Concatenate new K, V with cached
+                    k = torch.cat([cached_k, k], dim=2)
+                    v = torch.cat([cached_v, v], dim=2)
+                
+                # Store updated K, V in cache
+                self.kv_cache.store_kv(layer_idx, k, v)
+            elif use_kv_cache and self.kv_cache:
+                # Store K, V in cache for first time or full sequence
+                self.kv_cache.store_kv(layer_idx, k, v)
+            
+            # Handle GQA (Grouped Query Attention)
             if num_kv_heads < num_q_heads:
                 repeat_factor = num_q_heads // num_kv_heads
                 k = k.repeat_interleave(repeat_factor, dim=1)
                 v = v.repeat_interleave(repeat_factor, dim=1)
             
-            attention_scores = torch.matmul(q, k.transpose(-2, -1))
-            attention_scores = attention_scores / (head_dim ** 0.5)
-            attention_probs = F.softmax(attention_scores, dim=-1)
-            context = torch.matmul(attention_probs, v)
+            # Use optimized attention if available
+            context = optimized_attention(q, k, v, is_causal=True)
+            
+            # Reshape and apply output projection
             context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_size)
             output = F.linear(context, weights[o_key])
             
@@ -861,7 +1094,7 @@ class SimpleChunkedModelWithCheckpoints:
         try:
             gate = F.linear(hidden_states, weights[gate_key])
             up = F.linear(hidden_states, weights[up_key])
-            gate = gate * torch.sigmoid(gate)
+            gate = gate * torch.sigmoid(gate)  # SwiGLU activation
             intermediate = gate * up
             output = F.linear(intermediate, weights[down_key])
             return output
@@ -870,8 +1103,9 @@ class SimpleChunkedModelWithCheckpoints:
                 print(f"   Error in MLP for layer {layer_idx}: {e}")
             return hidden_states
     
-    def process_layer_chunk(self, hidden_states: torch.Tensor, start_layer: int, end_layer: int, verbose: bool = True) -> torch.Tensor:
-        """Process hidden states through a chunk of layers"""
+    def process_layer_chunk_optimized(self, hidden_states: torch.Tensor, start_layer: int, 
+                                    end_layer: int, use_kv_cache: bool = True, verbose: bool = True) -> torch.Tensor:
+        """Process hidden states through a chunk of layers with optimizations"""
         current_states = hidden_states
         
         for layer_idx in range(start_layer, end_layer + 1):
@@ -889,8 +1123,8 @@ class SimpleChunkedModelWithCheckpoints:
                 except Exception:
                     pass
             
-            # Attention
-            attn_output = self.simple_attention(current_states, layer_idx, verbose=verbose)
+            # Optimized attention with KV caching
+            attn_output = self.simple_attention_optimized(current_states, layer_idx, use_kv_cache, verbose=verbose)
             current_states = residual + attn_output
             
             # Post attention layer norm and MLP
@@ -937,12 +1171,16 @@ class SimpleChunkedModelWithCheckpoints:
     def generate_chunked_with_checkpoints(self, prompt: str = None, max_tokens: int = 50,
                                         checkpoint_every: int = 10, checkpoint_name: str = None,
                                         resume_from: str = None) -> Generator[str, None, None]:
-        """Generate text with checkpoint support"""
+        """Generate text with checkpoint support and performance optimizations"""
         
         self.generation_start_time = time.time()
         self.tokens_generated = 0
         self.total_chunks_processed = 0
         self.chunk_times = []
+        
+        # Reset KV cache for new generation
+        if self.kv_cache:
+            self.kv_cache.reset()
         
         # Handle resume logic
         if resume_from:
@@ -962,6 +1200,10 @@ class SimpleChunkedModelWithCheckpoints:
             # Restore RNG state for reproducibility
             if checkpoint.torch_rng_state:
                 self.restore_rng_state(checkpoint.torch_rng_state)
+            
+            # Update KV cache sequence length
+            if self.kv_cache:
+                self.kv_cache.seq_len = len(self.tokenizer.encode(prompt)) + len(generated_tokens) - 1
             
             # Yield already generated tokens for display
             if not self.quiet:
@@ -997,20 +1239,35 @@ class SimpleChunkedModelWithCheckpoints:
                 del embed_weights
                 torch.cuda.empty_cache()
             
+            # Initialize KV cache sequence length
+            if self.kv_cache:
+                self.kv_cache.seq_len = input_ids.size(1) - 1  # -1 because we'll increment for each new token
+            
             generated_tokens = []
             start_token = 0
         
         total_layers = self.config.num_hidden_layers
         
-        # Main generation loop with checkpoints
+        # Main generation loop with checkpoints and optimizations
         for token_idx in range(start_token, max_tokens):
-            # Move hidden states to CPU during layer processing
-            if self.keep_embeddings_on_cpu:
-                hidden_states_cpu = hidden_states.cpu()
-                del hidden_states
+            # For generation after the first token, we only need to process the last token
+            # thanks to KV caching
+            if token_idx > 0 and self.kv_cache:
+                # Only process the new token (last position)
+                current_input = hidden_states[:, -1:, :]
+                use_kv_cache = True
+            else:
+                # First token or no KV cache - process full sequence
+                current_input = hidden_states
+                use_kv_cache = False
+            
+            # Move hidden states to CPU during layer processing if needed
+            if self.keep_embeddings_on_cpu and token_idx > 0:
+                hidden_states_cpu = current_input.cpu()
+                del current_input
                 torch.cuda.empty_cache()
             else:
-                hidden_states_cpu = hidden_states
+                hidden_states_cpu = current_input
             
             current_states = hidden_states_cpu
             total_chunks = (total_layers + self.max_layers_in_vram - 1) // self.max_layers_in_vram
@@ -1022,7 +1279,8 @@ class SimpleChunkedModelWithCheckpoints:
                 # Progress indicator
                 progress = int((chunk_idx / total_chunks) * 100)
                 dots = "." * (progress // 5)
-                print(f"\rToken {token_idx + 1}/{max_tokens}: Processing ({progress:3d}%) {dots:<20} [Chunk {chunk_idx + 1}/{total_chunks}]", end="", flush=True)
+                cache_indicator = "🔥" if use_kv_cache else "❄️"
+                print(f"\rToken {token_idx + 1}/{max_tokens}: Processing ({progress:3d}%) {dots:<20} [Chunk {chunk_idx + 1}/{total_chunks}] {cache_indicator}", end="", flush=True)
                 
                 # Move states to GPU for processing
                 if self.keep_embeddings_on_cpu and current_states.device == torch.device('cpu'):
@@ -1031,7 +1289,9 @@ class SimpleChunkedModelWithCheckpoints:
                 # Load and process chunk
                 success = self.load_layer_chunk(start_layer, end_layer, verbose=False)
                 if success and self.layer_weights:
-                    current_states = self.process_layer_chunk(current_states, start_layer, end_layer, verbose=False)
+                    current_states = self.process_layer_chunk_optimized(
+                        current_states, start_layer, end_layer, use_kv_cache, verbose=False
+                    )
                 
                 self.clear_vram_cache()
                 
@@ -1041,13 +1301,22 @@ class SimpleChunkedModelWithCheckpoints:
                     torch.cuda.empty_cache()
             
             # Complete progress
-            print(f"\rToken {token_idx + 1}/{max_tokens}: Processing (100%) .................... [Chunk {total_chunks}/{total_chunks}] ✓", end="", flush=True)
+            cache_indicator = "🔥" if use_kv_cache else "❄️"
+            print(f"\rToken {token_idx + 1}/{max_tokens}: Processing (100%) .................... [Chunk {total_chunks}/{total_chunks}] {cache_indicator} ✓", end="", flush=True)
             
             # Ensure final states are on GPU for token generation
             if current_states.device == torch.device('cpu'):
                 current_states = current_states.to(self.device)
             
-            hidden_states = current_states
+            # For KV cached generation, we need to get the last hidden state
+            if use_kv_cache and self.kv_cache:
+                # current_states should be [batch, 1, hidden] for the new token
+                last_hidden = current_states[:, -1, :]
+                # Update KV cache sequence length
+                self.kv_cache.extend_sequence()
+            else:
+                # For first token or no cache, get the last position
+                last_hidden = current_states[:, -1, :]
             
             # Generate next token
             lm_head_weights = self.get_lm_head_weights()
@@ -1056,10 +1325,9 @@ class SimpleChunkedModelWithCheckpoints:
             
             if lm_head_weights is not None:
                 # Ensure LM head weights are on same device as hidden states
-                if lm_head_weights.device != hidden_states.device:
-                    lm_head_weights = lm_head_weights.to(hidden_states.device)
+                if lm_head_weights.device != last_hidden.device:
+                    lm_head_weights = lm_head_weights.to(last_hidden.device)
                 
-                last_hidden = hidden_states[:, -1, :]
                 logits = F.linear(last_hidden, lm_head_weights)
                 
                 if self.keep_embeddings_on_cpu:
@@ -1078,14 +1346,19 @@ class SimpleChunkedModelWithCheckpoints:
             generated_tokens.append(next_token)
             yield next_token
             
-            # Update hidden states
+            # Update hidden states for next iteration
             embed_weights = self.get_embedding_weights()
             if embed_weights is not None:
                 new_embedding = F.embedding(next_token_id, embed_weights).to(self.dtype)
                 if self.keep_embeddings_on_cpu:
                     del embed_weights
                     torch.cuda.empty_cache()
-                hidden_states = torch.cat([hidden_states, new_embedding], dim=1)
+                
+                # For KV caching, we maintain the full sequence
+                if use_kv_cache:
+                    hidden_states = torch.cat([hidden_states, new_embedding], dim=1)
+                else:
+                    hidden_states = torch.cat([current_states, new_embedding], dim=1)
             
             self.tokens_generated += 1
             
@@ -1109,6 +1382,11 @@ class SimpleChunkedModelWithCheckpoints:
             print("\n🧹 Cleaning up...")
         
         self.layer_weights.clear()
+        if self.weight_cache:
+            self.weight_cache.clear()
+        if self.kv_cache:
+            self.kv_cache.reset()
+        
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
@@ -1116,11 +1394,15 @@ class SimpleChunkedModelWithCheckpoints:
             print("✅ Cleanup complete")
 
 
+# Backwards compatibility alias
+SimpleChunkedModelWithCheckpoints = OptimizedChunkedModelWithCheckpoints
+
+
 def main():
-    """Main application with checkpoint support"""
+    """Main application with checkpoint support and optimizations"""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Chunked Inference with Checkpoint Support")
+    parser = argparse.ArgumentParser(description="Optimized Chunked Inference with Checkpoint Support")
     parser.add_argument("--model", required=True, help="Model path or HuggingFace model name")
     parser.add_argument("--vram", type=float, default=4.0, help="Max VRAM in GB")
     parser.add_argument("--prompt", default="The future of AI is", help="Generation prompt")
@@ -1130,6 +1412,12 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="Hide initialization messages")
     parser.add_argument("--chunk-layers", type=int, help="Layers per chunk")
     parser.add_argument("--max-context", type=int, help="Maximum context length (default: use model's max)")
+    
+    # Performance optimization arguments
+    parser.add_argument("--no-optimizations", action="store_true", help="Disable performance optimizations")
+    parser.add_argument("--no-kv-cache", action="store_true", help="Disable KV caching")
+    parser.add_argument("--no-weight-cache", action="store_true", help="Disable weight caching")
+    parser.add_argument("--no-quantization", action="store_true", help="Disable INT8 quantization")
     
     # Checkpoint arguments
     parser.add_argument("--checkpoint-every", type=int, default=10, help="Save checkpoint every N tokens")
@@ -1176,11 +1464,30 @@ def main():
         manager.cleanup_old_checkpoints()
         return
     
-    # Create model
-    model = SimpleChunkedModelWithCheckpoints(
+    # Create model with optimization settings
+    enable_optimizations = not args.no_optimizations
+    
+    model = OptimizedChunkedModelWithCheckpoints(
         args.model, args.vram, args.temperature, args.quiet, 
-        args.chunk_layers, args.checkpoint_dir, args.max_context
+        args.chunk_layers, args.checkpoint_dir, args.max_context,
+        enable_optimizations=enable_optimizations
     )
+    
+    # Apply specific optimization disables
+    if args.no_kv_cache and model.kv_cache:
+        model.kv_cache = None
+        if not args.quiet:
+            print("⚠️  KV caching disabled")
+    
+    if args.no_weight_cache and model.weight_cache:
+        model.weight_cache = None
+        if not args.quiet:
+            print("⚠️  Weight caching disabled")
+    
+    if args.no_quantization:
+        model.enable_quantization = False
+        if not args.quiet:
+            print("⚠️  Quantization disabled")
     
     try:
         # Initialize
@@ -1192,13 +1499,16 @@ def main():
             print("❌ Failed to create memory maps")
             return
         
-        # Generate with checkpoints
+        # Generate with checkpoints and optimizations
         if not args.quiet:
             if args.resume_from:
                 print(f"\n🔄 Resuming from: {args.resume_from}")
             else:
                 print(f"\n🎯 Prompt: {args.prompt}")
             print("🤖 Response:", end="", flush=True)
+        
+        generation_start = time.time()
+        token_count = 0
         
         for token in model.generate_chunked_with_checkpoints(
             prompt=args.prompt,
@@ -1207,16 +1517,29 @@ def main():
             checkpoint_name=args.checkpoint_name,
             resume_from=args.resume_from
         ):
-            pass  # Token is already printed in generate method
+            token_count += 1
+        
+        generation_time = time.time() - generation_start
         
         print(f"\n{'✅ Generation complete!' if not args.quiet else ''}")
         
         # Show final stats
         if not args.quiet:
-            elapsed_time = time.time() - model.generation_start_time
-            tokens_per_second = model.tokens_generated / elapsed_time if elapsed_time > 0 else 0
-            print(f"📊 Performance: {model.tokens_generated} tokens in {elapsed_time:.1f}s ({tokens_per_second:.2f} tok/s)")
+            tokens_per_second = token_count / generation_time if generation_time > 0 else 0
+            print(f"📊 Performance: {token_count} tokens in {generation_time:.1f}s ({tokens_per_second:.2f} tok/s)")
             print(f"🔧 Processed {model.total_chunks_processed} chunks total")
+            
+            if enable_optimizations:
+                optimizations_used = []
+                if model.kv_cache:
+                    optimizations_used.append("KV Cache")
+                if model.weight_cache:
+                    optimizations_used.append("Weight Cache")
+                if model.enable_quantization:
+                    optimizations_used.append("INT8 Quantization")
+                
+                if optimizations_used:
+                    print(f"⚡ Optimizations used: {', '.join(optimizations_used)}")
         
     except KeyboardInterrupt:
         print(f"\n⏹️  Generation interrupted. Progress saved in checkpoints.")
