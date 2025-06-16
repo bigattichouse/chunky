@@ -1408,7 +1408,7 @@ class OptimizedChunkedModelWithCheckpoints:
     
     def generate_chunked_with_checkpoints(self, prompt: str = None, max_tokens: int = 50,
                                         checkpoint_every: int = 10, checkpoint_name: str = None,
-                                        resume_from: str = None) -> Generator[str, None, None]:
+                                        resume_from: str = None, debug_tokens: bool = False) -> Generator[str, None, None]:
         """Generate text with checkpoint support and performance optimizations"""
         
         self.generation_start_time = time.time()
@@ -1461,15 +1461,42 @@ class OptimizedChunkedModelWithCheckpoints:
             if not self.quiet:
                 print(f"🎯 Starting new generation: '{prompt[:50]}...'")
             
-            # Tokenize and embed
-            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(self.device)
-            input_ids = inputs["input_ids"]
+            # Tokenize and embed with validation
+            try:
+                inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(self.device)
+                input_ids = inputs["input_ids"]
+                
+                # Validate input tokenization
+                if not self.quiet or debug_tokens:
+                    print(f"🔍 Input tokens: {input_ids.shape} -> {input_ids[0][:10].tolist()}...")
+                    print(f"🔍 Token vocab size: {self.tokenizer.vocab_size}")
+                    print(f"🔍 Model vocab size: {self.config.vocab_size}")
+                    
+                    # Verify tokenization by decoding back
+                    decoded_check = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+                    print(f"🔍 Decode check: '{decoded_check[:50]}...'")
+                
+                # Validate all token IDs are within vocabulary
+                max_token_id = input_ids.max().item()
+                if max_token_id >= self.config.vocab_size:
+                    print(f"⚠️  Warning: Token ID {max_token_id} >= vocab size {self.config.vocab_size}")
+                
+            except Exception as e:
+                print(f"❌ Tokenization error: {e}")
+                raise RuntimeError(f"Failed to tokenize input: {e}")
             
             embed_weights = self.get_embedding_weights()
             if embed_weights is None:
                 # Try to debug what's available
                 self.debug_model_architecture()
                 raise RuntimeError("Could not load embedding weights")
+            
+            # Validate embedding weights shape
+            if not self.quiet:
+                print(f"🔍 Embedding weights shape: {embed_weights.shape}")
+                expected_vocab_size = embed_weights.shape[0]
+                if expected_vocab_size != self.config.vocab_size:
+                    print(f"⚠️  Embedding vocab size {expected_vocab_size} != config vocab size {self.config.vocab_size}")
             
             hidden_states = F.embedding(input_ids, embed_weights).to(self.dtype)
             
@@ -1574,7 +1601,7 @@ class OptimizedChunkedModelWithCheckpoints:
                 # For first token or no cache, get the last position
                 last_hidden = current_states[:, -1, :]
             
-            # Generate next token
+            # Generate next token with proper validation
             lm_head_weights = self.get_lm_head_weights()
             if lm_head_weights is None:
                 lm_head_weights = self.get_embedding_weights()
@@ -1584,21 +1611,95 @@ class OptimizedChunkedModelWithCheckpoints:
                 if lm_head_weights.device != last_hidden.device:
                     lm_head_weights = lm_head_weights.to(last_hidden.device)
                 
+                # Generate logits
                 logits = F.linear(last_hidden, lm_head_weights)
+                
+                # Validate logits shape and vocabulary size
+                if logits.size(-1) != self.config.vocab_size:
+                    if not self.quiet or debug_tokens:
+                        print(f"\n⚠️  Logits size mismatch: {logits.size(-1)} vs vocab size {self.config.vocab_size}")
+                
+                if debug_tokens and token_idx < 3:  # Only show for first few tokens
+                    print(f"\n🔍 Token {token_idx}: Logits shape {logits.shape}, range [{logits.min():.2f}, {logits.max():.2f}]")
                 
                 if self.keep_embeddings_on_cpu:
                     del lm_head_weights
                     torch.cuda.empty_cache()
                 
+                # Apply temperature and get probabilities
                 logits = logits / self.temperature
-                probs = F.softmax(logits, dim=-1)
-                next_token_id = torch.multinomial(probs, 1)
+                
+                # Clamp logits to prevent extreme values
+                logits = torch.clamp(logits, min=-100, max=100)
+                
+                # Check for invalid logits
+                if torch.isnan(logits).any() or torch.isinf(logits).any():
+                    if not self.quiet:
+                        print(f"\n⚠️  Invalid logits detected, using fallback sampling")
+                    next_token_id = torch.randint(1, min(1000, self.config.vocab_size), (1, 1), device=self.device)
+                else:
+                    probs = F.softmax(logits, dim=-1)
+                    
+                    # Sample token
+                    next_token_id = torch.multinomial(probs, 1)
+                    
+                    # Validate token ID is within vocabulary
+                    if next_token_id.item() >= self.config.vocab_size:
+                        if not self.quiet:
+                            print(f"\n⚠️  Invalid token ID {next_token_id.item()}, clamping to vocab size")
+                        next_token_id = torch.clamp(next_token_id, 0, self.config.vocab_size - 1)
             else:
-                next_token_id = torch.randint(0, self.config.vocab_size, (1, 1), device=self.device)
+                # Fallback: generate a reasonable token ID
+                next_token_id = torch.randint(1, min(1000, self.config.vocab_size), (1, 1), device=self.device)
             
-            # Decode token
-            next_token = self.tokenizer.decode(next_token_id[0], skip_special_tokens=True)
-            print(f" {next_token}", end="", flush=True)
+            # Decode token with better error handling
+            try:
+                # Extract the token ID as integer
+                token_id = next_token_id.item()
+                
+                # Validate token ID
+                if token_id < 0 or token_id >= self.tokenizer.vocab_size:
+                    if not self.quiet or debug_tokens:
+                        print(f"\n⚠️  Token ID {token_id} out of range (0-{self.tokenizer.vocab_size-1}), using fallback")
+                    token_id = min(token_id, self.tokenizer.vocab_size - 1)
+                    token_id = max(token_id, 0)
+                
+                if debug_tokens and token_idx < 3:
+                    print(f"\n🔍 Decoding token ID {token_id}")
+                
+                # Decode the token
+                next_token = self.tokenizer.decode([token_id], skip_special_tokens=True)
+                
+                if debug_tokens and token_idx < 3:
+                    print(f"🔍 Decoded to: '{next_token}' (length: {len(next_token)})")
+                
+                # If decoding produces empty string or weird characters, use a fallback
+                if not next_token or len(next_token.strip()) == 0:
+                    next_token = " "  # Space as fallback
+                    if debug_tokens:
+                        print(f"🔍 Empty decode, using space fallback")
+                elif any(ord(c) > 127 for c in next_token):  # Contains non-ASCII
+                    # Check if it's actually valid Unicode or just garbage
+                    try:
+                        next_token.encode('utf-8')
+                        if debug_tokens and token_idx < 3:
+                            print(f"🔍 Non-ASCII but valid UTF-8: '{next_token}'")
+                    except UnicodeEncodeError:
+                        next_token = " "  # Space as fallback for invalid Unicode
+                        if debug_tokens:
+                            print(f"🔍 Invalid Unicode, using space fallback")
+                
+            except Exception as e:
+                if not self.quiet or debug_tokens:
+                    print(f"\n⚠️  Token decoding error: {e}, using fallback")
+                next_token = " "  # Space as fallback
+                next_token_id = torch.tensor([[self.tokenizer.unk_token_id or 0]], device=self.device)
+            
+            # Double-check the final token before outputting
+            if debug_tokens and token_idx < 3:
+                print(f"🔍 Final token: '{next_token}' -> adding to output")
+            
+            print(f"{next_token}", end="", flush=True)
             generated_tokens.append(next_token)
             yield next_token
             
@@ -1667,6 +1768,7 @@ Environment Variables:
 Examples:
   python chunky.py --model microsoft/DialoGPT-small --tokens 50
   python chunky.py --model your_model --output-file result.txt  # Save output to file
+  python chunky.py --model your_model --debug-tokens --tokens 5  # Debug tokenization issues
   DISABLE_TORCH_COMPILE=1 python chunky.py --model your_model  # Disable compilation
   python chunky.py --model your_model --no-kv-cache           # Disable KV caching
         """,
@@ -1682,6 +1784,7 @@ Examples:
     parser.add_argument("--chunk-layers", type=int, help="Layers per chunk")
     parser.add_argument("--max-context", type=int, help="Maximum context length (default: use model's max)")
     parser.add_argument("--output-file", help="Save complete output to file")
+    parser.add_argument("--debug-tokens", action="store_true", help="Show detailed token debugging info")
     
     # Performance optimization arguments
     parser.add_argument("--no-optimizations", action="store_true", help="Disable performance optimizations")
@@ -1794,7 +1897,8 @@ Examples:
             max_tokens=args.tokens,
             checkpoint_every=args.checkpoint_every,
             checkpoint_name=args.checkpoint_name,
-            resume_from=args.resume_from
+            resume_from=args.resume_from,
+            debug_tokens=args.debug_tokens
         ):
             generated_text.append(token)
             token_count += 1
