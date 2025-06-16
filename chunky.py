@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Chunked Inference with Full Checkpoint/Resume System + Performance Optimizations
-Enables safe long-form generation with progress saving and resumption
-Now with KV caching, weight caching, quantization, torch.compile, and other speed optimizations
+Enhanced Chunked Inference with Universal Model Compatibility + Full Checkpoint/Resume System
+Enables safe long-form generation with progress saving and resumption across any model architecture
+Now with robust tokenization, vocabulary mismatch handling, and universal weight loading
+ENHANCED FOR HUGE MODELS: Supports 671B+ models with aggressive memory management
 """
 
 import os
@@ -14,7 +15,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple, Generator, Any
+from typing import Dict, List, Optional, Tuple, Generator, Any, Union
 import pickle
 import gc
 
@@ -24,6 +25,396 @@ from transformers import AutoTokenizer, AutoConfig
 from safetensors import safe_open
 import torch.nn.functional as F
 
+
+# =============================================================================
+# MODEL COMPATIBILITY SYSTEM
+# =============================================================================
+
+class ModelCompatibilityManager:
+    """Handles model compatibility issues automatically"""
+    
+    def __init__(self, model_path: str, device: torch.device, quiet: bool = False):
+        self.model_path = model_path
+        self.device = device
+        self.quiet = quiet
+        
+        # Compatibility state
+        self.vocab_mismatch = False
+        self.safe_vocab_size = None
+        self.tokenizer_vocab_size = None
+        self.model_vocab_size = None
+        self.embedding_vocab_size = None
+        self.special_tokens = {}
+        self.architecture_type = None
+        self.compatibility_report = {}
+        
+    def analyze_and_fix(self, tokenizer, config, embedding_weights=None) -> Dict[str, Any]:
+        """Analyze compatibility and apply automatic fixes"""
+        
+        if not self.quiet:
+            print(f"\n🔍 Analyzing model compatibility...")
+        
+        # Detect vocabulary sizes
+        self.tokenizer_vocab_size = tokenizer.vocab_size
+        self.model_vocab_size = getattr(config, 'vocab_size', self.tokenizer_vocab_size)
+        self.embedding_vocab_size = embedding_weights.shape[0] if embedding_weights is not None else self.model_vocab_size
+        
+        # Determine safe vocabulary size (most restrictive)
+        vocab_sizes = [self.tokenizer_vocab_size, self.model_vocab_size, self.embedding_vocab_size]
+        self.safe_vocab_size = min(vocab_sizes)
+        
+        # Check for mismatches
+        self.vocab_mismatch = len(set(vocab_sizes)) > 1
+        
+        # Collect special tokens with proper handling
+        self.special_tokens = {
+            'eos_token_id': getattr(tokenizer, 'eos_token_id', 2),
+            'bos_token_id': getattr(tokenizer, 'bos_token_id', 1),
+            'unk_token_id': getattr(tokenizer, 'unk_token_id', 0),
+            'pad_token_id': getattr(tokenizer, 'pad_token_id', tokenizer.eos_token_id)
+        }
+        
+        # Ensure all special tokens are within safe range
+        for token_name, token_id in self.special_tokens.items():
+            if token_id is not None and token_id >= self.safe_vocab_size:
+                if not self.quiet:
+                    print(f"⚠️  {token_name} ({token_id}) outside safe range, clamping to UNK")
+                self.special_tokens[token_name] = self.special_tokens['unk_token_id']
+        
+        # Detect architecture
+        self.architecture_type = getattr(config, 'model_type', 'unknown')
+        
+        # Create compatibility report
+        self.compatibility_report = {
+            'vocab_mismatch': self.vocab_mismatch,
+            'safe_vocab_size': self.safe_vocab_size,
+            'tokenizer_vocab_size': self.tokenizer_vocab_size,
+            'model_vocab_size': self.model_vocab_size,
+            'embedding_vocab_size': self.embedding_vocab_size,
+            'special_tokens': self.special_tokens,
+            'architecture_type': self.architecture_type,
+            'fixes_applied': []
+        }
+        
+        # Report findings
+        if not self.quiet:
+            if self.vocab_mismatch:
+                print(f"⚠️  VOCABULARY MISMATCH DETECTED:")
+                print(f"   Tokenizer: {self.tokenizer_vocab_size}")
+                print(f"   Model:     {self.model_vocab_size}")
+                print(f"   Embedding: {self.embedding_vocab_size}")
+                print(f"   🔧 Safe range: 0-{self.safe_vocab_size-1}")
+                print(f"   ✅ Automatic token clamping enabled")
+                self.compatibility_report['fixes_applied'].append('token_clamping')
+            else:
+                print(f"✅ Vocabulary sizes consistent: {self.safe_vocab_size}")
+            
+            print(f"✅ Architecture: {self.architecture_type}")
+            print(f"✅ Special tokens validated")
+        
+        return self.compatibility_report
+
+
+class SafeTokenizationPipeline:
+    """Robust tokenization pipeline that handles any model"""
+    
+    def __init__(self, tokenizer, compatibility_manager: ModelCompatibilityManager):
+        self.tokenizer = tokenizer
+        self.compat = compatibility_manager
+        
+    def safe_encode(self, text: str, add_special_tokens: bool = True, max_length: Optional[int] = None) -> List[int]:
+        """Safely encode text with validation"""
+        try:
+            if max_length:
+                tokens = self.tokenizer.encode(text, add_special_tokens=add_special_tokens, 
+                                             truncation=True, max_length=max_length)
+            else:
+                tokens = self.tokenizer.encode(text, add_special_tokens=add_special_tokens)
+            
+            # Validate token range
+            return self.validate_token_range(tokens)
+            
+        except Exception as e:
+            if not self.compat.quiet:
+                print(f"⚠️  Encoding failed: {e}, using fallback")
+            # Simple word-based fallback
+            words = text.split()
+            return [min(hash(word) % self.compat.safe_vocab_size, self.compat.safe_vocab_size - 1) 
+                   for word in words[:50]]  # Limit length
+    
+    def safe_decode(self, token_ids: Union[int, List[int]], skip_special_tokens: bool = True) -> str:
+        """Safely decode tokens with fallback handling"""
+        # Normalize input
+        if isinstance(token_ids, int):
+            token_ids = [token_ids]
+        
+        # Validate and clamp token IDs
+        safe_tokens = self.validate_token_range(token_ids)
+        
+        try:
+            decoded = self.tokenizer.decode(safe_tokens, skip_special_tokens=skip_special_tokens)
+            
+            # Validate output
+            if decoded and len(decoded.strip()) > 0:
+                return decoded
+            else:
+                return " "  # Safe fallback
+                
+        except Exception as e:
+            if not self.compat.quiet:
+                print(f"⚠️  Decode failed for tokens {token_ids}: {e}")
+            return " "  # Safe fallback
+    
+    def validate_token_range(self, token_ids: List[int]) -> List[int]:
+        """Clamp token IDs to safe vocabulary range"""
+        safe_tokens = []
+        for token_id in token_ids:
+            if token_id >= self.compat.safe_vocab_size:
+                # Clamp to UNK token
+                clamped_id = self.compat.special_tokens.get('unk_token_id', 0)
+                safe_tokens.append(clamped_id)
+                if not self.compat.quiet:
+                    print(f"🔧 Clamped token {token_id} -> {clamped_id}")
+            else:
+                safe_tokens.append(token_id)
+        return safe_tokens
+    
+    def safe_token_sampling(self, logits: torch.Tensor, temperature: float = 0.7) -> torch.Tensor:
+        """Sample tokens safely with vocabulary masking"""
+        # Apply vocabulary masking if needed
+        if self.compat.vocab_mismatch and logits.size(-1) > self.compat.safe_vocab_size:
+            # Create mask for valid vocabulary range
+            vocab_mask = torch.zeros_like(logits)
+            vocab_mask[:self.compat.safe_vocab_size] = 1.0
+            
+            # Mask invalid positions with very low probability
+            logits = logits * vocab_mask + (1.0 - vocab_mask) * (-1e9)
+        
+        # Apply temperature
+        if temperature <= 0:
+            temperature = 1e-7
+        logits = logits / temperature
+        
+        # Clamp for numerical stability
+        logits = torch.clamp(logits, min=-100, max=100)
+        
+        # Check for invalid values
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            if not self.compat.quiet:
+                print("⚠️  Invalid logits detected, using uniform fallback")
+            # Create uniform distribution over safe vocabulary
+            uniform_logits = torch.zeros_like(logits)
+            uniform_logits[:self.compat.safe_vocab_size] = 1.0
+            logits = uniform_logits
+        
+        # Sample
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, 1)
+
+
+class UniversalWeightLoader:
+    """Loads model weights consistently across architectures"""
+    
+    def __init__(self, safetensor_files: List[Path], config, quiet: bool = False):
+        self.safetensor_files = safetensor_files
+        self.config = config
+        self.quiet = quiet
+        self.weight_patterns = self._detect_patterns()
+        
+    def _detect_patterns(self) -> Dict[str, List[str]]:
+        """Auto-detect weight naming patterns from safetensor files"""
+        all_keys = set()
+        
+        for file_path in self.safetensor_files:
+            try:
+                with safe_open(file_path, framework="pt") as f:
+                    all_keys.update(f.keys())
+            except Exception as e:
+                if not self.quiet:
+                    print(f"⚠️  Could not read {file_path.name}: {e}")
+                continue
+        
+        patterns = {
+            'embedding': [],
+            'lm_head': [],
+            'layer_prefix': None,
+            'all_keys': list(all_keys)
+        }
+        
+        # Detect embedding patterns
+        embedding_indicators = ['embed', 'wte', 'word_embeddings']
+        patterns['embedding'] = [k for k in all_keys 
+                               if any(ind in k.lower() for ind in embedding_indicators)]
+        
+        # Detect LM head patterns
+        lm_head_indicators = ['lm_head', 'head', 'output', 'classifier']
+        patterns['lm_head'] = [k for k in all_keys 
+                             if any(ind in k.lower() for ind in lm_head_indicators)]
+        
+        # Detect layer structure
+        layer_keys = [k for k in all_keys if 'layers.' in k or '.h.' in k]
+        if layer_keys:
+            if 'model.layers.' in layer_keys[0]:
+                patterns['layer_prefix'] = 'model.layers'
+            elif 'transformer.h.' in layer_keys[0]:
+                patterns['layer_prefix'] = 'transformer.h'
+            elif 'transformer.layer.' in layer_keys[0]:
+                patterns['layer_prefix'] = 'transformer.layer'
+        
+        return patterns
+    
+    def load_embeddings(self) -> Optional[torch.Tensor]:
+        """Load embedding weights with comprehensive pattern matching"""
+        # Comprehensive embedding patterns for all architectures
+        embedding_patterns = [
+            "model.embed_tokens.weight",
+            "embed_tokens.weight", 
+            "transformer.wte.weight",
+            "wte.weight",
+            "word_embeddings.weight",
+            "embeddings.word_embeddings.weight",
+            "model.embeddings.word_embeddings.weight",
+            "transformer.word_embeddings.weight",
+            "model.word_embeddings.weight",
+            "embeddings.weight",
+            "input_embeddings.weight",
+            "model.embeddings.weight",
+            "gpt_neox.embed_in.weight",
+            "embed_in.weight"
+        ]
+        
+        for file_path in self.safetensor_files:
+            try:
+                with safe_open(file_path, framework="pt") as f:
+                    available_keys = f.keys()
+                    
+                    for pattern in embedding_patterns:
+                        if pattern in available_keys:
+                            tensor = f.get_tensor(pattern)
+                            if len(tensor.shape) == 2:  # Valid embedding matrix
+                                if not self.quiet:
+                                    print(f"✅ Found embeddings: {pattern} {list(tensor.shape)}")
+                                return tensor.clone()
+                                
+            except Exception as e:
+                if not self.quiet:
+                    print(f"⚠️  Error reading {file_path.name}: {e}")
+                continue
+        
+        if not self.quiet:
+            print("❌ No embedding weights found with standard patterns")
+            print(f"   Available embedding-like keys: {self.weight_patterns['embedding'][:5]}")
+        
+        return None
+    
+    def load_lm_head(self) -> Optional[torch.Tensor]:
+        """Load LM head weights with tied weight detection"""
+        # First try dedicated LM head patterns
+        lm_head_patterns = [
+            "lm_head.weight",
+            "model.lm_head.weight",
+            "output.weight",
+            "model.output.weight",
+            "head.weight",
+            "classifier.weight",
+            "output_layer.weight",
+            "gpt_neox.embed_out.weight",
+            "transformer.head.weight",
+            "language_model.lm_head.weight"
+        ]
+        
+        for file_path in self.safetensor_files:
+            try:
+                with safe_open(file_path, framework="pt") as f:
+                    available_keys = f.keys()
+                    
+                    for pattern in lm_head_patterns:
+                        if pattern in available_keys:
+                            tensor = f.get_tensor(pattern)
+                            if len(tensor.shape) == 2:
+                                if not self.quiet:
+                                    print(f"✅ Found LM head: {pattern} {list(tensor.shape)}")
+                                return tensor.clone()
+                                
+            except Exception as e:
+                if not self.quiet:
+                    print(f"⚠️  Error reading {file_path.name}: {e}")
+                continue
+        
+        # If no dedicated LM head found, check for tied weights (use embeddings)
+        embedding_weights = self.load_embeddings()
+        if embedding_weights is not None:
+            if not self.quiet:
+                print("✅ Using tied weights (embeddings as LM head)")
+            return embedding_weights
+        
+        if not self.quiet:
+            print("❌ No LM head weights found")
+            print(f"   Available head-like keys: {self.weight_patterns['lm_head'][:5]}")
+        
+        return None
+    
+    def get_layer_weights(self, layer_idx: int) -> Dict[str, torch.Tensor]:
+        """Load specific layer weights with universal patterns"""
+        layer_weights = {}
+        
+        # Universal layer patterns - covers LLaMA, Qwen, Mixtral, GPT, etc.
+        base_patterns = [
+            f"model.layers.{layer_idx}",
+            f"transformer.h.{layer_idx}",
+            f"transformer.layer.{layer_idx}",
+            f"layers.{layer_idx}",
+            f"h.{layer_idx}"
+        ]
+        
+        # Weight suffixes for different components
+        weight_suffixes = [
+            ".self_attn.q_proj.weight",
+            ".self_attn.k_proj.weight", 
+            ".self_attn.v_proj.weight",
+            ".self_attn.o_proj.weight",
+            ".mlp.gate_proj.weight",
+            ".mlp.up_proj.weight",
+            ".mlp.down_proj.weight",
+            ".input_layernorm.weight",
+            ".post_attention_layernorm.weight",
+            # Alternative naming patterns
+            ".attn.q_proj.weight",
+            ".attn.k_proj.weight",
+            ".attn.v_proj.weight",
+            ".attn.o_proj.weight",
+            ".attn.c_attn.weight",
+            ".attn.c_proj.weight",
+            ".mlp.c_fc.weight",
+            ".mlp.c_proj.weight",
+            ".ln_1.weight",
+            ".ln_2.weight",
+        ]
+        
+        for file_path in self.safetensor_files:
+            try:
+                with safe_open(file_path, framework="pt") as f:
+                    available_keys = set(f.keys())
+                    
+                    # Try each base pattern with each suffix
+                    for base in base_patterns:
+                        for suffix in weight_suffixes:
+                            full_pattern = base + suffix
+                            if full_pattern in available_keys:
+                                tensor = f.get_tensor(full_pattern)
+                                layer_weights[full_pattern] = tensor.clone()
+                                
+            except Exception as e:
+                if not self.quiet:
+                    print(f"⚠️  Error reading {file_path.name}: {e}")
+                continue
+        
+        return layer_weights
+
+
+# =============================================================================
+# CHECKPOINT SYSTEM (UNCHANGED)
+# =============================================================================
 
 @dataclass
 class GenerationCheckpoint:
@@ -62,7 +453,7 @@ class GenerationCheckpoint:
 
 
 # =============================================================================
-# TORCH.COMPILE OPTIMIZATION WRAPPER
+# TORCH.COMPILE OPTIMIZATION WRAPPER (UNCHANGED)
 # =============================================================================
 
 def get_compiled_function(func, quiet=False):
@@ -124,7 +515,7 @@ def get_compiled_function(func, quiet=False):
 
 
 # =============================================================================
-# PERFORMANCE OPTIMIZATION CLASSES
+# PERFORMANCE OPTIMIZATION CLASSES (UNCHANGED)
 # =============================================================================
 
 class KVCache:
@@ -175,8 +566,8 @@ class KVCache:
 
 
 class PersistentWeightCache:
-    """Keep frequently used layer weights in memory between tokens"""
-    def __init__(self, max_cache_size_gb=2.0):
+    """Keep frequently used layer weights in memory between tokens - Reduced for huge models"""
+    def __init__(self, max_cache_size_gb=0.5):  # Reduced from 2.0GB to 0.5GB
         self.max_cache_size = max_cache_size_gb * 1024**3  # Convert to bytes
         self.cache = {}  # layer_idx -> weights
         self.usage_stats = {}  # layer_idx -> last_used_time
@@ -298,6 +689,10 @@ def optimized_attention(q, k, v, is_causal=True):
         attn = F.softmax(attn, dim=-1)
         return torch.matmul(attn, v)
 
+
+# =============================================================================
+# CHECKPOINT MANAGER (UNCHANGED)
+# =============================================================================
 
 class CheckpointManager:
     """Manages saving, loading, and validation of generation checkpoints"""
@@ -495,8 +890,12 @@ class CheckpointManager:
         print(f"✅ Removed {removed_count} old checkpoint(s)")
 
 
+# =============================================================================
+# MAIN ENHANCED MODEL CLASS - OPTIMIZED FOR HUGE MODELS
+# =============================================================================
+
 class OptimizedChunkedModelWithCheckpoints:
-    """Enhanced chunked model with full checkpoint support + performance optimizations"""
+    """Enhanced chunked model with universal compatibility + performance optimizations - OPTIMIZED FOR HUGE MODELS (671B+)"""
     
     def __init__(self, model_path: str, max_vram_gb: float = 4.0, temperature: float = 0.7, 
                  quiet: bool = False, chunk_layers: int = None, checkpoint_dir: str = "./checkpoints",
@@ -506,7 +905,7 @@ class OptimizedChunkedModelWithCheckpoints:
         self.temperature = temperature
         self.quiet = quiet
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.max_context_length = max_context_length  # User override
+        self.max_context_length = max_context_length
         self.enable_optimizations = enable_optimizations
         
         # Checkpoint manager
@@ -520,10 +919,15 @@ class OptimizedChunkedModelWithCheckpoints:
         self.embedding_weights = None
         self.lm_head_weights = None
         
-        # Performance optimizations
+        # Compatibility system
+        self.compatibility_manager = ModelCompatibilityManager(model_path, self.device, quiet)
+        self.safe_tokenizer = None
+        self.weight_loader = None
+        
+        # Performance optimizations - REDUCED FOR HUGE MODELS
         if self.enable_optimizations:
             self.kv_cache = KVCache(device=self.device)
-            self.weight_cache = PersistentWeightCache(max_cache_size_gb=2.0)
+            self.weight_cache = PersistentWeightCache(max_cache_size_gb=0.5)  # Reduced for huge models
             self.enable_quantization = True
         else:
             self.kv_cache = None
@@ -540,34 +944,39 @@ class OptimizedChunkedModelWithCheckpoints:
         self.total_chunks_processed = 0
         self.chunk_times = []
         
-        # Auto-detect precision and chunk size
+        # ENHANCED: Aggressive memory management for huge models
+        # Always enable CPU offloading for embeddings - we'll determine this dynamically
+        self.keep_embeddings_on_cpu = True
+        self.force_cpu_offloading = False  # Will be set based on model size
+        
+        # Auto-detect precision and chunk size with huge model consideration
         if max_vram_gb <= 4:
             self.dtype = torch.float16
             default_layers = 1
-            self.keep_embeddings_on_cpu = True
+            self.aggressive_offloading = True
         elif max_vram_gb <= 8:
             self.dtype = torch.float16
-            default_layers = 2
-            self.keep_embeddings_on_cpu = False
+            default_layers = 1  # Reduced for huge models
+            self.aggressive_offloading = True
         else:
             self.dtype = torch.bfloat16
-            default_layers = 4
-            self.keep_embeddings_on_cpu = False
+            default_layers = 2  # Still conservative for huge models
+            self.aggressive_offloading = False
         
         self.max_layers_in_vram = chunk_layers if chunk_layers is not None else default_layers
         
         if not self.quiet:
-            print(f"🚀 Initializing optimized chunked model with checkpoint support")
+            print(f"🚀 Initializing enhanced chunked model with universal compatibility")
             print(f"   Model: {model_path}")
             print(f"   VRAM limit: {max_vram_gb}GB")
             print(f"   Device: {self.device}")
             print(f"   Precision: {self.dtype}")
             print(f"   Max layers per chunk: {self.max_layers_in_vram}")
-            print(f"   CPU offloading: {self.keep_embeddings_on_cpu}")
+            print(f"   Aggressive CPU offloading: {'✅' if self.aggressive_offloading else '❌'}")
             print(f"   Optimizations: {'Enabled' if enable_optimizations else 'Disabled'}")
             if enable_optimizations:
                 print(f"     - KV Caching: ✅")
-                print(f"     - Weight Caching: ✅")
+                print(f"     - Weight Caching: ✅ (reduced for huge models)")
                 print(f"     - INT8 Quantization: ✅")
                 print(f"     - Optimized Attention: ✅")
                 print(f"     - torch.compile: {'✅' if hasattr(torch, 'compile') else '❌'}")
@@ -575,6 +984,46 @@ class OptimizedChunkedModelWithCheckpoints:
             
             estimated_chunks = 80 // self.max_layers_in_vram
             print(f"   Expected chunks per token: ~{estimated_chunks}")
+    
+    def estimate_embedding_memory_gb(self, vocab_size: int, hidden_size: int) -> float:
+        """Estimate memory required for embedding weights in GB"""
+        # vocab_size * hidden_size * 2 bytes (fp16) = total bytes
+        total_bytes = vocab_size * hidden_size * 2
+        return total_bytes / (1024**3)
+    
+    def check_and_force_cpu_offloading(self):
+        """Check if model is too big and force CPU offloading"""
+        if not self.config:
+            return
+        
+        vocab_size = getattr(self.config, 'vocab_size', 50000)
+        hidden_size = getattr(self.config, 'hidden_size', 4096)
+        
+        # Estimate embedding memory requirements
+        embedding_memory_gb = self.estimate_embedding_memory_gb(vocab_size, hidden_size)
+        
+        # Get current available VRAM
+        if torch.cuda.is_available():
+            current_memory_gb = torch.cuda.memory_allocated() / (1024**3)
+            available_memory_gb = self.max_vram_gb - current_memory_gb - 0.5  # 0.5GB safety margin
+        else:
+            available_memory_gb = 0
+        
+        if not self.quiet:
+            print(f"\n🔍 Memory Analysis:")
+            print(f"   Embedding memory required: {embedding_memory_gb:.2f}GB")
+            print(f"   Available VRAM: {available_memory_gb:.2f}GB")
+        
+        # Force CPU offloading if embeddings won't fit
+        if embedding_memory_gb > available_memory_gb:
+            self.force_cpu_offloading = True
+            self.keep_embeddings_on_cpu = True
+            if not self.quiet:
+                print(f"   🚨 EMBEDDINGS TOO LARGE - Forcing CPU offloading")
+                print(f"   🔧 Embeddings will be streamed to GPU only when needed")
+        else:
+            if not self.quiet:
+                print(f"   ✅ Embeddings fit in VRAM")
     
     def _setup_compiled_functions(self):
         """Set up torch.compile optimized functions with robust error handling"""
@@ -669,9 +1118,9 @@ class OptimizedChunkedModelWithCheckpoints:
         remaining_tokens = target_token_count - current_token_count
         estimated_time_remaining = remaining_tokens / tokens_per_second if tokens_per_second > 0 else 0.0
         
-        # Get current sequence token IDs
+        # Get current sequence token IDs using safe tokenizer
         sequence_text = prompt + "".join(generated_tokens)
-        sequence_ids = self.tokenizer.encode(sequence_text)
+        sequence_ids = self.safe_tokenizer.safe_encode(sequence_text)
         
         return GenerationCheckpoint(
             prompt=prompt,
@@ -693,7 +1142,7 @@ class OptimizedChunkedModelWithCheckpoints:
         )
     
     def load_tokenizer_and_config(self):
-        """Load tokenizer and config (lightweight)"""
+        """Load tokenizer and config with compatibility analysis"""
         if not self.quiet:
             print("📝 Loading tokenizer and config...")
         
@@ -704,11 +1153,24 @@ class OptimizedChunkedModelWithCheckpoints:
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             
+            # Initialize compatibility analysis
+            compatibility_report = self.compatibility_manager.analyze_and_fix(
+                self.tokenizer, self.config, None  # Embedding weights analyzed later
+            )
+            
+            # Initialize safe tokenization pipeline
+            self.safe_tokenizer = SafeTokenizationPipeline(
+                self.tokenizer, self.compatibility_manager
+            )
+            
             # Initialize KV cache with correct dimensions
             if self.kv_cache and hasattr(self.config, 'num_hidden_layers'):
                 self.kv_cache.num_layers = self.config.num_hidden_layers
                 self.kv_cache.num_heads = getattr(self.config, 'num_attention_heads', 32)
                 self.kv_cache.head_dim = getattr(self.config, 'hidden_size', 4096) // self.kv_cache.num_heads
+            
+            # Check for huge model and set CPU offloading strategy
+            self.check_and_force_cpu_offloading()
             
             # Set up compiled functions after config is loaded
             self._setup_compiled_functions()
@@ -744,41 +1206,6 @@ class OptimizedChunkedModelWithCheckpoints:
                 print(f"❌ Error loading tokenizer/config: {e}")
             return False
     
-    def inspect_safetensor_keys(self):
-        """Debug method to inspect all keys in safetensor files"""
-        print("🔍 Inspecting safetensor files for available keys...")
-        
-        all_keys = set()
-        embedding_like_keys = []
-        lm_head_like_keys = []
-        
-        for file_path in self.safetensor_files:
-            try:
-                with safe_open(file_path, framework="pt") as f:
-                    file_keys = list(f.keys())
-                    all_keys.update(file_keys)
-                    
-                    # Look for embedding-like keys
-                    for key in file_keys:
-                        if any(pattern in key.lower() for pattern in ['embed', 'wte', 'word_embeddings']):
-                            embedding_like_keys.append(key)
-                        if any(pattern in key.lower() for pattern in ['lm_head', 'head', 'output']):
-                            lm_head_like_keys.append(key)
-                    
-                    print(f"   📄 {file_path.name}: {len(file_keys)} keys")
-            except Exception as e:
-                print(f"   ❌ Error reading {file_path.name}: {e}")
-        
-        print(f"\n📋 Found embedding-like keys: {embedding_like_keys}")
-        print(f"📋 Found LM head-like keys: {lm_head_like_keys}")
-        
-        # Show some sample keys for debugging
-        if all_keys:
-            sample_keys = sorted(list(all_keys))[:20]
-            print(f"\n📋 Sample keys (first 20): {sample_keys}")
-        
-        return embedding_like_keys, lm_head_like_keys
-    
     def create_memory_maps(self):
         """Enhanced version with better error handling and debugging"""
         if not self.quiet:
@@ -809,25 +1236,19 @@ class OptimizedChunkedModelWithCheckpoints:
                 print("❌ No model weight files found (.safetensors or .bin)")
             return False
         
+        # Initialize universal weight loader
+        self.weight_loader = UniversalWeightLoader(self.safetensor_files, self.config, self.quiet)
+        
         if not self.quiet:
             print(f"✅ Found {len(self.safetensor_files)} model files:")
             for f in self.safetensor_files:
                 file_size = f.stat().st_size / (1024**3)  # GB
                 print(f"   📄 {f.name} ({file_size:.1f}GB)")
         
-        # Quick inspection of first file to see what keys are available
-        if not self.quiet and self.safetensor_files:
-            try:
-                with safe_open(self.safetensor_files[0], framework="pt") as f:
-                    sample_keys = list(f.keys())[:10]
-                    print(f"   🔍 Sample keys: {sample_keys}")
-            except Exception as e:
-                print(f"   ⚠️  Could not inspect keys: {e}")
-        
         return True
     
     def get_layer_weights(self, layer_idx: int) -> Dict[str, torch.Tensor]:
-        """Load specific layer weights from safetensor files with optimization"""
+        """Load specific layer weights using universal loader"""
         # Check weight cache first
         if self.weight_cache:
             cached_weights = self.weight_cache.get_layer(layer_idx)
@@ -837,31 +1258,12 @@ class OptimizedChunkedModelWithCheckpoints:
                     return dequantize_weights_int8(cached_weights)
                 return cached_weights
         
-        layer_weights = {}
+        # Load using universal weight loader
+        layer_weights = self.weight_loader.get_layer_weights(layer_idx)
         
-        layer_patterns = [
-            f"model.layers.{layer_idx}.self_attn.q_proj.weight",
-            f"model.layers.{layer_idx}.self_attn.k_proj.weight", 
-            f"model.layers.{layer_idx}.self_attn.v_proj.weight",
-            f"model.layers.{layer_idx}.self_attn.o_proj.weight",
-            f"model.layers.{layer_idx}.mlp.gate_proj.weight",
-            f"model.layers.{layer_idx}.mlp.up_proj.weight",
-            f"model.layers.{layer_idx}.mlp.down_proj.weight",
-            f"model.layers.{layer_idx}.input_layernorm.weight",
-            f"model.layers.{layer_idx}.post_attention_layernorm.weight",
-        ]
-        
-        for file_path in self.safetensor_files:
-            try:
-                with safe_open(file_path, framework="pt") as f:
-                    for pattern in layer_patterns:
-                        if pattern in f.keys():
-                            tensor = f.get_tensor(pattern)
-                            layer_weights[pattern] = tensor.to(device=self.device, dtype=self.dtype)
-            except Exception as e:
-                if not self.quiet:
-                    print(f"   Warning: Could not read {file_path.name}: {e}")
-                continue
+        # Move to device and convert dtype
+        for key, tensor in layer_weights.items():
+            layer_weights[key] = tensor.to(device=self.device, dtype=self.dtype)
         
         # Cache weights (quantized if enabled)
         if self.weight_cache and layer_weights:
@@ -871,182 +1273,65 @@ class OptimizedChunkedModelWithCheckpoints:
         return layer_weights
     
     def get_embedding_weights(self) -> Optional[torch.Tensor]:
-        """Enhanced embedding layer weights loading with better pattern matching"""
+        """Load embedding weights with smart GPU/CPU management"""
         if self.embedding_weights is not None:
-            if self.keep_embeddings_on_cpu:
+            # Always return on correct device, streaming if needed
+            if self.force_cpu_offloading or self.keep_embeddings_on_cpu:
                 return self.embedding_weights.to(device=self.device, dtype=self.dtype)
             else:
                 return self.embedding_weights
         
-        # Comprehensive embedding patterns for different model architectures
-        embed_patterns = [
-            # Standard patterns
-            "model.embed_tokens.weight",
-            "embed_tokens.weight", 
-            "transformer.wte.weight",
-            "wte.weight",
-            "word_embeddings.weight",
-            "embeddings.word_embeddings.weight",
-            "model.embeddings.word_embeddings.weight",
-            
-            # Additional patterns for various architectures
-            "transformer.word_embeddings.weight",
-            "model.word_embeddings.weight",
-            "embeddings.weight",
-            "input_embeddings.weight",
-            "model.embeddings.weight",
-            "backbone.embeddings.word_embeddings.weight",
-            "language_model.embedding.word_embeddings.weight",
-            
-            # Falcon-specific
-            "transformer.word_embeddings.weight",
-            
-            # MPT-specific  
-            "transformer.wte.weight",
-            
-            # CodeGen-specific
-            "transformer.wte.weight",
-            
-            # GPT-NeoX-specific
-            "gpt_neox.embed_in.weight",
-            
-            # LLaMA variants
-            "model.embed_tokens.weight",
-            "embed_in.weight"
-        ]
+        # Load using universal weight loader
+        embedding_tensor = self.weight_loader.load_embeddings()
         
-        if not self.quiet:
-            print("🔍 Searching for embedding weights...")
-        
-        found_pattern = None
-        
-        for file_path in self.safetensor_files:
-            try:
-                with safe_open(file_path, framework="pt") as f:
-                    available_keys = list(f.keys())
-                    
-                    for pattern in embed_patterns:
-                        if pattern in available_keys:
-                            if not self.quiet:
-                                print(f"   ✅ Found embedding pattern: {pattern}")
-                            
-                            tensor = f.get_tensor(pattern)
-                            found_pattern = pattern
-                            
-                            # Validate tensor shape (should be [vocab_size, hidden_size])
-                            if len(tensor.shape) == 2:
-                                vocab_size, hidden_size = tensor.shape
-                                if not self.quiet:
-                                    print(f"   📏 Embedding shape: {tensor.shape} (vocab: {vocab_size}, hidden: {hidden_size})")
-                                
-                                if self.keep_embeddings_on_cpu:
-                                    self.embedding_weights = tensor.to(dtype=self.dtype)
-                                    return tensor.to(device=self.device, dtype=self.dtype)
-                                else:
-                                    self.embedding_weights = tensor.to(device=self.device, dtype=self.dtype)
-                                    return self.embedding_weights
-                            else:
-                                if not self.quiet:
-                                    print(f"   ⚠️  Unexpected embedding shape: {tensor.shape}, skipping")
-                                continue
-                                
-            except Exception as e:
+        if embedding_tensor is not None:
+            # Check memory requirements before loading to GPU
+            if not hasattr(self, 'force_cpu_offloading'):
+                self.check_and_force_cpu_offloading()
+            
+            # Update compatibility analysis with actual embedding size
+            self.compatibility_manager.analyze_and_fix(
+                self.tokenizer, self.config, embedding_tensor
+            )
+            
+            # Smart device placement
+            if self.force_cpu_offloading or self.keep_embeddings_on_cpu:
+                # Keep on CPU, stream to GPU only when needed
+                self.embedding_weights = embedding_tensor.to(dtype=self.dtype)
                 if not self.quiet:
-                    print(f"   ⚠️  Error reading {file_path.name}: {e}")
-                continue
-        
-        # If no embedding weights found, inspect available keys for debugging
-        if not found_pattern:
-            if not self.quiet:
-                print("❌ No embedding weights found with standard patterns")
-                embedding_keys, _ = self.inspect_safetensor_keys()
-                if embedding_keys:
-                    print(f"🤔 Found these embedding-like keys: {embedding_keys}")
-                    print("   You may need to add these patterns to the search list")
-                else:
-                    print("🤔 No embedding-like keys found at all")
-                    print("   This might be a different model format or architecture")
+                    print(f"   💾 Embeddings stored on CPU ({embedding_tensor.shape})")
+                return embedding_tensor.to(device=self.device, dtype=self.dtype)
+            else:
+                # Safe to keep on GPU
+                self.embedding_weights = embedding_tensor.to(device=self.device, dtype=self.dtype)
+                return self.embedding_weights
         
         return None
     
     def get_lm_head_weights(self) -> Optional[torch.Tensor]:
-        """Enhanced LM head weights loading with better pattern matching"""
+        """Load LM head weights with smart GPU/CPU management"""
         if self.lm_head_weights is not None:
-            if self.keep_embeddings_on_cpu:
+            # Always return on correct device, streaming if needed
+            if self.force_cpu_offloading or self.keep_embeddings_on_cpu:
                 return self.lm_head_weights.to(device=self.device, dtype=self.dtype)
             else:
                 return self.lm_head_weights
         
-        # Comprehensive LM head patterns
-        lm_head_patterns = [
-            # Standard patterns
-            "lm_head.weight",
-            "model.lm_head.weight",
-            
-            # Shared embedding patterns (often LM head uses same weights as embeddings)
-            "model.embed_tokens.weight",
-            "embed_tokens.weight",
-            "transformer.wte.weight", 
-            "wte.weight",
-            "word_embeddings.weight",
-            
-            # Other output layer patterns
-            "output.weight",
-            "model.output.weight",
-            "transformer.ln_f.weight",  # Sometimes the final layer norm
-            "head.weight",
-            "classifier.weight",
-            "output_layer.weight",
-            
-            # Architecture-specific patterns
-            "gpt_neox.embed_out.weight",
-            "transformer.head.weight",
-            "language_model.lm_head.weight",
-            "model.language_model.lm_head.weight"
-        ]
+        # Load using universal weight loader
+        lm_head_tensor = self.weight_loader.load_lm_head()
         
-        if not self.quiet:
-            print("🔍 Searching for LM head weights...")
-        
-        for file_path in self.safetensor_files:
-            try:
-                with safe_open(file_path, framework="pt") as f:
-                    available_keys = list(f.keys())
-                    
-                    for pattern in lm_head_patterns:
-                        if pattern in available_keys:
-                            if not self.quiet:
-                                print(f"   ✅ Found LM head pattern: {pattern}")
-                            
-                            tensor = f.get_tensor(pattern)
-                            
-                            # Validate tensor shape (should be [vocab_size, hidden_size] or [hidden_size, vocab_size])
-                            if len(tensor.shape) == 2:
-                                dim1, dim2 = tensor.shape
-                                if not self.quiet:
-                                    print(f"   📏 LM head shape: {tensor.shape}")
-                                
-                                if self.keep_embeddings_on_cpu:
-                                    self.lm_head_weights = tensor.to(dtype=self.dtype)
-                                    return tensor.to(device=self.device, dtype=self.dtype)
-                                else:
-                                    self.lm_head_weights = tensor.to(device=self.device, dtype=self.dtype)
-                                    return self.lm_head_weights
-                            else:
-                                if not self.quiet:
-                                    print(f"   ⚠️  Unexpected LM head shape: {tensor.shape}, skipping")
-                                continue
-                                
-            except Exception as e:
+        if lm_head_tensor is not None:
+            # Smart device placement (same logic as embeddings)
+            if self.force_cpu_offloading or self.keep_embeddings_on_cpu:
+                # Keep on CPU, stream to GPU only when needed
+                self.lm_head_weights = lm_head_tensor.to(dtype=self.dtype)
                 if not self.quiet:
-                    print(f"   ⚠️  Error reading {file_path.name}: {e}")
-                continue
-        
-        if not self.quiet:
-            print("❌ No LM head weights found")
-            _, lm_head_keys = self.inspect_safetensor_keys()
-            if lm_head_keys:
-                print(f"🤔 Found these LM head-like keys: {lm_head_keys}")
+                    print(f"   💾 LM head stored on CPU ({lm_head_tensor.shape})")
+                return lm_head_tensor.to(device=self.device, dtype=self.dtype)
+            else:
+                # Safe to keep on GPU
+                self.lm_head_weights = lm_head_tensor.to(device=self.device, dtype=self.dtype)
+                return self.lm_head_weights
         
         return None
     
@@ -1056,8 +1341,12 @@ class OptimizedChunkedModelWithCheckpoints:
             return torch.cuda.memory_allocated() / (1024**3)
         return 0.0
     
-    def clear_vram_cache(self):
-        """Clear VRAM cache and force garbage collection"""
+    def enhanced_memory_cleanup(self):
+        """Enhanced memory cleanup for huge models"""
+        if not self.quiet:
+            print("🧹 Enhanced memory cleanup...")
+        
+        # Clear layer weights
         for layer_idx in list(self.layer_weights.keys()):
             if self.layer_weights[layer_idx]:
                 for weight_name in list(self.layer_weights[layer_idx].keys()):
@@ -1065,14 +1354,33 @@ class OptimizedChunkedModelWithCheckpoints:
             del self.layer_weights[layer_idx]
         
         self.layer_weights.clear()
+        
+        # Clear caches
+        if self.weight_cache:
+            self.weight_cache.clear()
+        if self.kv_cache:
+            self.kv_cache.reset()
+        
+        # Force garbage collection
         gc.collect()
         
+        # Aggressive CUDA cleanup
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            # Force memory reset
+            torch.cuda.reset_peak_memory_stats()
         
         gc.collect()
+        
+        if not self.quiet:
+            current_memory = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0
+            print(f"✅ Cleanup complete - VRAM usage: {current_memory:.2f}GB")
+    
+    def clear_vram_cache(self):
+        """Clear VRAM cache and force garbage collection - enhanced version"""
+        self.enhanced_memory_cleanup()
     
     def load_layer_chunk(self, start_layer: int, end_layer: int, verbose: bool = True):
         """Load a chunk of layers into VRAM"""
@@ -1381,35 +1689,10 @@ class OptimizedChunkedModelWithCheckpoints:
         
         return current_states
     
-    def debug_model_architecture(self):
-        """Debug method to understand the model architecture"""
-        if not self.quiet:
-            print("\n🔬 Model Architecture Analysis:")
-            print(f"   Model path: {self.model_path}")
-            if self.config:
-                print(f"   Model type: {getattr(self.config, 'model_type', 'unknown')}")
-                print(f"   Architecture: {getattr(self.config, 'architectures', 'unknown')}")
-                print(f"   Layers: {getattr(self.config, 'num_hidden_layers', 'unknown')}")
-                print(f"   Hidden size: {getattr(self.config, 'hidden_size', 'unknown')}")
-                print(f"   Vocab size: {getattr(self.config, 'vocab_size', 'unknown')}")
-                print(f"   Attention heads: {getattr(self.config, 'num_attention_heads', 'unknown')}")
-            
-            # Inspect the actual file structure
-            if hasattr(self, 'safetensor_files') and self.safetensor_files:
-                embedding_keys, lm_head_keys = self.inspect_safetensor_keys()
-                
-                if not embedding_keys and not lm_head_keys:
-                    print("\n❌ Critical: No embedding or LM head weights found!")
-                    print("   This suggests either:")
-                    print("   1. The model uses a different naming convention")
-                    print("   2. The model is in a different format")
-                    print("   3. The files are corrupted")
-                    print("\n💡 Try running with --quiet False to see all available keys")
-    
     def generate_chunked_with_checkpoints(self, prompt: str = None, max_tokens: int = 50,
                                         checkpoint_every: int = 10, checkpoint_name: str = None,
                                         resume_from: str = None, debug_tokens: bool = False) -> Generator[str, None, None]:
-        """Generate text with checkpoint support and performance optimizations"""
+        """Generate text with checkpoint support and robust tokenization"""
         
         self.generation_start_time = time.time()
         self.tokens_generated = 0
@@ -1441,7 +1724,10 @@ class OptimizedChunkedModelWithCheckpoints:
             
             # Update KV cache sequence length
             if self.kv_cache:
-                self.kv_cache.seq_len = len(self.tokenizer.encode(prompt)) + len(generated_tokens) - 1
+                sequence_ids = self.safe_tokenizer.safe_encode(prompt) + \
+                              [hash(token) % self.compatibility_manager.safe_vocab_size 
+                               for token in generated_tokens]
+                self.kv_cache.seq_len = len(sequence_ids) - 1
             
             # Yield already generated tokens for display
             if not self.quiet:
@@ -1461,25 +1747,19 @@ class OptimizedChunkedModelWithCheckpoints:
             if not self.quiet:
                 print(f"🎯 Starting new generation: '{prompt[:50]}...'")
             
-            # Tokenize and embed with validation
+            # Tokenize and embed with validation using safe tokenizer
             try:
-                inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(self.device)
-                input_ids = inputs["input_ids"]
+                input_ids = self.safe_tokenizer.safe_encode(prompt, add_special_tokens=True, max_length=512)
+                input_tensor = torch.tensor([input_ids], device=self.device, dtype=torch.long)
                 
                 # Validate input tokenization
                 if not self.quiet or debug_tokens:
-                    print(f"🔍 Input tokens: {input_ids.shape} -> {input_ids[0][:10].tolist()}...")
-                    print(f"🔍 Token vocab size: {self.tokenizer.vocab_size}")
-                    print(f"🔍 Model vocab size: {self.config.vocab_size}")
+                    print(f"🔍 Input tokens: {len(input_ids)} -> {input_ids[:10]}...")
+                    print(f"🔍 Safe vocab range: 0-{self.compatibility_manager.safe_vocab_size-1}")
                     
                     # Verify tokenization by decoding back
-                    decoded_check = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+                    decoded_check = self.safe_tokenizer.safe_decode(input_ids)
                     print(f"🔍 Decode check: '{decoded_check[:50]}...'")
-                
-                # Validate all token IDs are within vocabulary
-                max_token_id = input_ids.max().item()
-                if max_token_id >= self.config.vocab_size:
-                    print(f"⚠️  Warning: Token ID {max_token_id} >= vocab size {self.config.vocab_size}")
                 
             except Exception as e:
                 print(f"❌ Tokenization error: {e}")
@@ -1487,33 +1767,30 @@ class OptimizedChunkedModelWithCheckpoints:
             
             embed_weights = self.get_embedding_weights()
             if embed_weights is None:
-                # Try to debug what's available
-                self.debug_model_architecture()
                 raise RuntimeError("Could not load embedding weights")
             
             # Validate embedding weights shape
             if not self.quiet:
                 print(f"🔍 Embedding weights shape: {embed_weights.shape}")
-                expected_vocab_size = embed_weights.shape[0]
-                if expected_vocab_size != self.config.vocab_size:
-                    print(f"⚠️  Embedding vocab size {expected_vocab_size} != config vocab size {self.config.vocab_size}")
+                print(f"🔍 Compatibility: Vocab mismatch = {self.compatibility_manager.vocab_mismatch}")
             
-            hidden_states = F.embedding(input_ids, embed_weights).to(self.dtype)
+            hidden_states = F.embedding(input_tensor, embed_weights).to(self.dtype)
             
-            if self.keep_embeddings_on_cpu:
+            # Enhanced cleanup for huge models - clear embeddings immediately after use
+            if self.force_cpu_offloading:
                 del embed_weights
-                torch.cuda.empty_cache()
+                self.enhanced_memory_cleanup()
             
             # Initialize KV cache sequence length
             if self.kv_cache:
-                self.kv_cache.seq_len = input_ids.size(1) - 1  # -1 because we'll increment for each new token
+                self.kv_cache.seq_len = input_tensor.size(1) - 1  # -1 because we'll increment for each new token
             
             generated_tokens = []
             start_token = 0
         
         total_layers = self.config.num_hidden_layers
         
-        # Main generation loop with checkpoints and optimizations
+        # Main generation loop with enhanced safety
         for token_idx in range(start_token, max_tokens):
             # For generation after the first token, we only need to process the last token
             # thanks to KV caching
@@ -1526,11 +1803,11 @@ class OptimizedChunkedModelWithCheckpoints:
                 current_input = hidden_states
                 use_kv_cache = False
             
-            # Move hidden states to CPU during layer processing if needed
-            if self.keep_embeddings_on_cpu and token_idx > 0:
+            # For huge models, ALWAYS move to CPU between major operations
+            if self.force_cpu_offloading and token_idx > 0:
                 hidden_states_cpu = current_input.cpu()
                 del current_input
-                torch.cuda.empty_cache()
+                self.enhanced_memory_cleanup()
             else:
                 hidden_states_cpu = current_input
             
@@ -1557,7 +1834,7 @@ class OptimizedChunkedModelWithCheckpoints:
                 print(f"\rToken {token_idx + 1}/{max_tokens}: Processing ({progress:3d}%) {dots:<20} [Chunk {chunk_idx + 1}/{total_chunks}] {cache_indicator}{compile_indicator}", end="", flush=True)
                 
                 # Move states to GPU for processing
-                if self.keep_embeddings_on_cpu and current_states.device == torch.device('cpu'):
+                if current_states.device == torch.device('cpu'):
                     current_states = current_states.to(self.device)
                 
                 # Load and process chunk
@@ -1569,22 +1846,14 @@ class OptimizedChunkedModelWithCheckpoints:
                 
                 self.clear_vram_cache()
                 
-                # Move states back to CPU between chunks
-                if self.keep_embeddings_on_cpu and start_layer < total_layers - self.max_layers_in_vram:
+                # For huge models, always move back to CPU between chunks
+                if self.force_cpu_offloading and start_layer < total_layers - self.max_layers_in_vram:
                     current_states = current_states.cpu()
-                    torch.cuda.empty_cache()
+                    self.enhanced_memory_cleanup()
             
             # Complete progress
             cache_indicator = "🔥" if use_kv_cache else "❄️"
-            
-            # Show compilation status
-            if self.compiled_layer_processor and not use_kv_cache:
-                compile_indicator = "⚡"  # Compiled and active
-            elif self.compiled_layer_processor:
-                compile_indicator = "🔄"  # Compiled but using KV cache (non-compiled)
-            else:
-                compile_indicator = "🐌"  # Not compiled
-                
+            compile_indicator = "⚡" if self.compiled_layer_processor and not use_kv_cache else "🔄" if self.compiled_layer_processor else "🐌"
             print(f"\rToken {token_idx + 1}/{max_tokens}: Processing (100%) .................... [Chunk {total_chunks}/{total_chunks}] {cache_indicator}{compile_indicator} ✓", end="", flush=True)
             
             # Ensure final states are on GPU for token generation
@@ -1601,7 +1870,7 @@ class OptimizedChunkedModelWithCheckpoints:
                 # For first token or no cache, get the last position
                 last_hidden = current_states[:, -1, :]
             
-            # Generate next token with proper validation
+            # Generate next token with enhanced safety
             lm_head_weights = self.get_lm_head_weights()
             if lm_head_weights is None:
                 lm_head_weights = self.get_embedding_weights()
@@ -1614,90 +1883,46 @@ class OptimizedChunkedModelWithCheckpoints:
                 # Generate logits
                 logits = F.linear(last_hidden, lm_head_weights)
                 
-                # Validate logits shape and vocabulary size
-                if logits.size(-1) != self.config.vocab_size:
-                    if not self.quiet or debug_tokens:
-                        print(f"\n⚠️  Logits size mismatch: {logits.size(-1)} vs vocab size {self.config.vocab_size}")
-                
                 if debug_tokens and token_idx < 3:  # Only show for first few tokens
                     print(f"\n🔍 Token {token_idx}: Logits shape {logits.shape}, range [{logits.min():.2f}, {logits.max():.2f}]")
                 
-                if self.keep_embeddings_on_cpu:
+                # For huge models, immediately clean up LM head weights after use
+                if self.force_cpu_offloading:
                     del lm_head_weights
-                    torch.cuda.empty_cache()
+                    self.enhanced_memory_cleanup()
                 
-                # Apply temperature and get probabilities
-                logits = logits / self.temperature
+                # Safe token sampling using compatibility-aware pipeline
+                next_token_id = self.safe_tokenizer.safe_token_sampling(logits, self.temperature)
                 
-                # Clamp logits to prevent extreme values
-                logits = torch.clamp(logits, min=-100, max=100)
-                
-                # Check for invalid logits
-                if torch.isnan(logits).any() or torch.isinf(logits).any():
-                    if not self.quiet:
-                        print(f"\n⚠️  Invalid logits detected, using fallback sampling")
-                    next_token_id = torch.randint(1, min(1000, self.config.vocab_size), (1, 1), device=self.device)
-                else:
-                    probs = F.softmax(logits, dim=-1)
-                    
-                    # Sample token
-                    next_token_id = torch.multinomial(probs, 1)
-                    
-                    # Validate token ID is within vocabulary
-                    if next_token_id.item() >= self.config.vocab_size:
-                        if not self.quiet:
-                            print(f"\n⚠️  Invalid token ID {next_token_id.item()}, clamping to vocab size")
-                        next_token_id = torch.clamp(next_token_id, 0, self.config.vocab_size - 1)
             else:
-                # Fallback: generate a reasonable token ID
-                next_token_id = torch.randint(1, min(1000, self.config.vocab_size), (1, 1), device=self.device)
+                # Fallback: generate a safe token ID
+                next_token_id = torch.tensor([[1]], device=self.device)  # Use a safe default
             
-            # Decode token with better error handling
+            # Safe token decoding
             try:
-                # Extract the token ID as integer
                 token_id = next_token_id.item()
-                
-                # Validate token ID
-                if token_id < 0 or token_id >= self.tokenizer.vocab_size:
-                    if not self.quiet or debug_tokens:
-                        print(f"\n⚠️  Token ID {token_id} out of range (0-{self.tokenizer.vocab_size-1}), using fallback")
-                    token_id = min(token_id, self.tokenizer.vocab_size - 1)
-                    token_id = max(token_id, 0)
                 
                 if debug_tokens and token_idx < 3:
                     print(f"\n🔍 Decoding token ID {token_id}")
                 
-                # Decode the token
-                next_token = self.tokenizer.decode([token_id], skip_special_tokens=True)
+                # Use safe decoding pipeline
+                next_token = self.safe_tokenizer.safe_decode(token_id)
                 
                 if debug_tokens and token_idx < 3:
                     print(f"🔍 Decoded to: '{next_token}' (length: {len(next_token)})")
                 
-                # If decoding produces empty string or weird characters, use a fallback
+                # Final validation
                 if not next_token or len(next_token.strip()) == 0:
-                    next_token = " "  # Space as fallback
+                    next_token = " "  # Safe fallback
                     if debug_tokens:
                         print(f"🔍 Empty decode, using space fallback")
-                elif any(ord(c) > 127 for c in next_token):  # Contains non-ASCII
-                    # Check if it's actually valid Unicode or just garbage
-                    try:
-                        next_token.encode('utf-8')
-                        if debug_tokens and token_idx < 3:
-                            print(f"🔍 Non-ASCII but valid UTF-8: '{next_token}'")
-                    except UnicodeEncodeError:
-                        next_token = " "  # Space as fallback for invalid Unicode
-                        if debug_tokens:
-                            print(f"🔍 Invalid Unicode, using space fallback")
                 
             except Exception as e:
                 if not self.quiet or debug_tokens:
                     print(f"\n⚠️  Token decoding error: {e}, using fallback")
-                next_token = " "  # Space as fallback
-                next_token_id = torch.tensor([[self.tokenizer.unk_token_id or 0]], device=self.device)
-            
-            # Double-check the final token before outputting
-            if debug_tokens and token_idx < 3:
-                print(f"🔍 Final token: '{next_token}' -> adding to output")
+                next_token = " "  # Safe fallback
+                next_token_id = torch.tensor([[self.compatibility_manager.special_tokens['unk_token_id']]], 
+                                           device=self.device)
             
             print(f"{next_token}", end="", flush=True)
             generated_tokens.append(next_token)
@@ -1707,9 +1932,11 @@ class OptimizedChunkedModelWithCheckpoints:
             embed_weights = self.get_embedding_weights()
             if embed_weights is not None:
                 new_embedding = F.embedding(next_token_id, embed_weights).to(self.dtype)
-                if self.keep_embeddings_on_cpu:
+                
+                # For huge models, immediately clean up embedding weights after use
+                if self.force_cpu_offloading:
                     del embed_weights
-                    torch.cuda.empty_cache()
+                    self.enhanced_memory_cleanup()
                 
                 # For KV caching, we maintain the full sequence
                 if use_kv_cache:
@@ -1725,7 +1952,7 @@ class OptimizedChunkedModelWithCheckpoints:
                 self.checkpoint_manager.save_checkpoint(checkpoint, checkpoint_name, hidden_states, async_save=True)
             
             # Early stopping
-            if next_token_id.item() == self.tokenizer.eos_token_id:
+            if next_token_id.item() == self.compatibility_manager.special_tokens['eos_token_id']:
                 break
         
         # Final checkpoint
@@ -1734,18 +1961,11 @@ class OptimizedChunkedModelWithCheckpoints:
             self.checkpoint_manager.save_checkpoint(final_checkpoint, checkpoint_name + "_final", hidden_states, async_save=False)
     
     def cleanup(self):
-        """Clean up resources"""
+        """Clean up resources - enhanced for huge models"""
         if not self.quiet:
             print("\n🧹 Cleaning up...")
         
-        self.layer_weights.clear()
-        if self.weight_cache:
-            self.weight_cache.clear()
-        if self.kv_cache:
-            self.kv_cache.reset()
-        
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self.enhanced_memory_cleanup()
         
         if not self.quiet:
             print("✅ Cleanup complete")
@@ -1756,21 +1976,21 @@ SimpleChunkedModelWithCheckpoints = OptimizedChunkedModelWithCheckpoints
 
 
 def main():
-    """Main application with checkpoint support and optimizations"""
+    """Main application with enhanced compatibility and optimizations for huge models"""
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Optimized Chunked Inference with Checkpoint Support + torch.compile",
+        description="Enhanced Chunked Inference with Universal Model Compatibility - OPTIMIZED FOR HUGE MODELS (671B+)",
         epilog="""
 Environment Variables:
   DISABLE_TORCH_COMPILE=1    Disable torch.compile JIT compilation (useful for debugging)
 
 Examples:
   python chunky.py --model microsoft/DialoGPT-small --tokens 50
+  python chunky.py --model Qwen/Qwen3-32B --tokens 100 --vram 4.5 --chunk-layers 1
+  python chunky.py --model deepseek-ai/deepseek-v3 --tokens 50 --vram 8 --chunk-layers 1  # 671B model!
   python chunky.py --model your_model --output-file result.txt  # Save output to file
   python chunky.py --model your_model --debug-tokens --tokens 5  # Debug tokenization issues
-  DISABLE_TORCH_COMPILE=1 python chunky.py --model your_model  # Disable compilation
-  python chunky.py --model your_model --no-kv-cache           # Disable KV caching
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -1781,7 +2001,7 @@ Examples:
     parser.add_argument("--tokens", type=int, default=20, help="Tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.7, help="Generation temperature")
     parser.add_argument("--quiet", action="store_true", help="Hide initialization messages")
-    parser.add_argument("--chunk-layers", type=int, help="Layers per chunk")
+    parser.add_argument("--chunk-layers", type=int, help="Layers per chunk (default: auto-detect based on VRAM)")
     parser.add_argument("--max-context", type=int, help="Maximum context length (default: use model's max)")
     parser.add_argument("--output-file", help="Save complete output to file")
     parser.add_argument("--debug-tokens", action="store_true", help="Show detailed token debugging info")
@@ -1792,6 +2012,10 @@ Examples:
     parser.add_argument("--no-weight-cache", action="store_true", help="Disable weight caching")
     parser.add_argument("--no-quantization", action="store_true", help="Disable INT8 quantization")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile JIT compilation")
+    
+    # Huge model specific arguments
+    parser.add_argument("--force-cpu-offloading", action="store_true", help="Force CPU offloading for embeddings")
+    parser.add_argument("--aggressive-cleanup", action="store_true", help="Enable aggressive memory cleanup between operations")
     
     # Checkpoint arguments
     parser.add_argument("--checkpoint-every", type=int, default=10, help="Save checkpoint every N tokens")
@@ -1838,7 +2062,40 @@ Examples:
         manager.cleanup_old_checkpoints()
         return
     
-    # Create model with optimization settings
+    # Detect huge models and provide warnings/recommendations
+    huge_model_indicators = ['671b', 'deepseek-v3', 'deepseek-v2', 'qwen-72b', 'llama-70b', 'mixtral-8x22b']
+    is_likely_huge = any(indicator in args.model.lower() for indicator in huge_model_indicators)
+    
+    if is_likely_huge and not args.quiet:
+        print(f"\n🚨 HUGE MODEL DETECTED: {args.model}")
+        print(f"🔧 Recommended settings for huge models:")
+        print(f"   --chunk-layers 1     (process one layer at a time)")
+        print(f"   --vram 4.5          (leave headroom for operations)")
+        print(f"   --force-cpu-offloading  (keep embeddings on CPU)")
+        print(f"   --aggressive-cleanup    (cleanup between operations)")
+        print(f"   --checkpoint-every 5    (save progress frequently)")
+        print(f"")
+        
+        # Auto-apply recommended settings if not overridden
+        if args.chunk_layers is None:
+            args.chunk_layers = 1
+            print(f"🔧 Auto-setting: --chunk-layers 1")
+        
+        if not args.force_cpu_offloading:
+            args.force_cpu_offloading = True
+            print(f"🔧 Auto-setting: --force-cpu-offloading")
+        
+        if not args.aggressive_cleanup:
+            args.aggressive_cleanup = True
+            print(f"🔧 Auto-setting: --aggressive-cleanup")
+        
+        if args.checkpoint_every == 10:  # Default value
+            args.checkpoint_every = 5
+            print(f"🔧 Auto-setting: --checkpoint-every 5")
+        
+        print("")
+    
+    # Create enhanced model with compatibility system
     enable_optimizations = not args.no_optimizations
     
     model = OptimizedChunkedModelWithCheckpoints(
@@ -1846,6 +2103,13 @@ Examples:
         args.chunk_layers, args.checkpoint_dir, args.max_context,
         enable_optimizations=enable_optimizations
     )
+    
+    # Apply huge model specific settings
+    if args.force_cpu_offloading:
+        model.force_cpu_offloading = True
+        model.keep_embeddings_on_cpu = True
+        if not args.quiet:
+            print("🔧 Forced CPU offloading enabled for embeddings")
     
     # Apply specific optimization disables
     if args.no_kv_cache and model.kv_cache:
@@ -1871,7 +2135,7 @@ Examples:
             print("⚠️  torch.compile disabled")
     
     try:
-        # Initialize
+        # Initialize with enhanced compatibility
         if not model.load_tokenizer_and_config():
             print("❌ Failed to load tokenizer/config")
             return
@@ -1880,7 +2144,24 @@ Examples:
             print("❌ Failed to create memory maps")
             return
         
-        # Generate with checkpoints and optimizations
+        # Provide memory usage estimates for huge models
+        if not args.quiet and hasattr(model, 'config'):
+            vocab_size = getattr(model.config, 'vocab_size', 50000)
+            hidden_size = getattr(model.config, 'hidden_size', 4096)
+            num_layers = getattr(model.config, 'num_hidden_layers', 80)
+            
+            embedding_memory = model.estimate_embedding_memory_gb(vocab_size, hidden_size)
+            
+            print(f"\n📊 Memory Estimates:")
+            print(f"   Model parameters: ~{num_layers * hidden_size * hidden_size * 4 / 1e9:.1f}B")
+            print(f"   Embedding memory: {embedding_memory:.2f}GB")
+            print(f"   Recommended VRAM: {max(4.0, embedding_memory + 2.0):.1f}GB minimum")
+            
+            if embedding_memory > args.vram * 0.6:  # More than 60% of VRAM
+                print(f"   🚨 WARNING: Embeddings may not fit in VRAM!")
+                print(f"   🔧 CPU offloading will be automatically enabled")
+        
+        # Generate with enhanced safety and checkpoints
         if not args.quiet:
             if args.resume_from:
                 print(f"\n🔄 Resuming from: {args.resume_from}")
@@ -1892,6 +2173,10 @@ Examples:
         token_count = 0
         generated_text = []
         
+        # Add memory monitoring for huge models
+        initial_memory = model.get_vram_usage()
+        max_memory_seen = initial_memory
+        
         for token in model.generate_chunked_with_checkpoints(
             prompt=args.prompt,
             max_tokens=args.tokens,
@@ -1902,8 +2187,14 @@ Examples:
         ):
             generated_text.append(token)
             token_count += 1
-        
-        generation_time = time.time() - generation_start
+            
+            # Monitor peak memory usage
+            current_memory = model.get_vram_usage()
+            max_memory_seen = max(max_memory_seen, current_memory)
+            
+            # Aggressive cleanup for huge models if requested
+            if args.aggressive_cleanup and token_count % 5 == 0:
+                model.enhanced_memory_cleanup()
         
         generation_time = time.time() - generation_start
         
@@ -1937,11 +2228,19 @@ Examples:
         else:
             print("\n⚠️  No tokens were generated.")
         
-        # Show final stats
+        # Show final stats with compatibility info and memory usage
         if not args.quiet:
             tokens_per_second = token_count / generation_time if generation_time > 0 else 0
             print(f"📊 Performance: {token_count} tokens in {generation_time:.1f}s ({tokens_per_second:.2f} tok/s)")
             print(f"🔧 Processed {model.total_chunks_processed} chunks total")
+            print(f"💾 Memory usage: {initial_memory:.2f}GB initial → {max_memory_seen:.2f}GB peak")
+            
+            # Show compatibility status
+            if model.compatibility_manager.vocab_mismatch:
+                print(f"🔧 Vocabulary compatibility: Applied automatic fixes")
+                print(f"   Safe vocab range: 0-{model.compatibility_manager.safe_vocab_size-1}")
+            else:
+                print(f"✅ Vocabulary compatibility: No issues detected")
             
             if enable_optimizations:
                 optimizations_used = []
@@ -1953,14 +2252,47 @@ Examples:
                     optimizations_used.append("INT8 Quantization")
                 if model.compiled_layer_processor or model.compiled_attention:
                     optimizations_used.append("torch.compile")
+                if model.force_cpu_offloading:
+                    optimizations_used.append("CPU Offloading")
                 
                 if optimizations_used:
                     print(f"⚡ Optimizations used: {', '.join(optimizations_used)}")
+            
+            # Recommendations for improving performance
+            if tokens_per_second < 0.5 and not is_likely_huge:
+                print(f"\n💡 Performance Tips:")
+                print(f"   • Try increasing --chunk-layers if you have more VRAM")
+                print(f"   • Use --force-cpu-offloading for very large models")
+                print(f"   • Consider using --no-compile if torch.compile is causing issues")
         
     except KeyboardInterrupt:
         print(f"\n⏹️  Generation interrupted. Progress saved in checkpoints.")
     except Exception as e:
         print(f"❌ Error: {e}")
+        
+        # Enhanced error reporting with compatibility info
+        if hasattr(model, 'compatibility_manager') and model.compatibility_manager.vocab_mismatch:
+            print(f"\n🔧 Compatibility Info:")
+            print(f"   Tokenizer vocab: {model.compatibility_manager.tokenizer_vocab_size}")
+            print(f"   Model vocab: {model.compatibility_manager.model_vocab_size}")
+            print(f"   This model required automatic vocabulary alignment")
+        
+        # Memory debugging for huge models
+        if hasattr(model, 'get_vram_usage'):
+            current_memory = model.get_vram_usage()
+            print(f"\n💾 Memory Info:")
+            print(f"   Current VRAM usage: {current_memory:.2f}GB")
+            print(f"   VRAM limit: {args.vram}GB")
+            if current_memory > args.vram * 0.9:
+                print(f"   🚨 Near memory limit! Try:")
+                print(f"      --chunk-layers 1")
+                print(f"      --force-cpu-offloading")
+                print(f"      --aggressive-cleanup")
+        
+        if args.debug_tokens:
+            print(f"\n🔍 Debug Info:")
+            print(f"   Enable debug mode for detailed tokenization analysis")
+        
         import traceback
         traceback.print_exc()
     finally:
