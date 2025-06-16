@@ -1,0 +1,18 @@
+# Chunky.py - Minimal Requirements for Large Model Inference
+# Core dependencies for chunked inference with checkpoint system
+
+# Essential ML libraries
+torch>=2.0.0
+transformers>=4.36.0
+safetensors>=0.4.0
+numpy>=1.24.0
+
+# Model downloading
+huggingface_hub>=0.19.0
+
+# Optional: Better performance on some systems
+accelerate>=0.24.0
+
+# Development/debugging (optional)
+# psutil>=5.9.0        # For system monitoring
+# nvidia-ml-py3>=7.352.0  # For GPU monitoring
