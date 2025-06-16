@@ -6,7 +6,7 @@ python chunky.py \
   --vram 5 \
   --chunk-layers 2 \
   --prompt "Write a linux commandline tetris program in C." \
-  --tokens 1000 \
+  --tokens 20 \
   --checkpoint-every 25 \
   --max-context 1024 \
   --checkpoint-name quantum_essay \
