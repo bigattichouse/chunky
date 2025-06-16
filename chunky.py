@@ -1666,6 +1666,7 @@ Environment Variables:
 
 Examples:
   python chunky.py --model microsoft/DialoGPT-small --tokens 50
+  python chunky.py --model your_model --output-file result.txt  # Save output to file
   DISABLE_TORCH_COMPILE=1 python chunky.py --model your_model  # Disable compilation
   python chunky.py --model your_model --no-kv-cache           # Disable KV caching
         """,
@@ -1680,6 +1681,7 @@ Examples:
     parser.add_argument("--quiet", action="store_true", help="Hide initialization messages")
     parser.add_argument("--chunk-layers", type=int, help="Layers per chunk")
     parser.add_argument("--max-context", type=int, help="Maximum context length (default: use model's max)")
+    parser.add_argument("--output-file", help="Save complete output to file")
     
     # Performance optimization arguments
     parser.add_argument("--no-optimizations", action="store_true", help="Disable performance optimizations")
@@ -1785,6 +1787,7 @@ Examples:
         
         generation_start = time.time()
         token_count = 0
+        generated_text = []
         
         for token in model.generate_chunked_with_checkpoints(
             prompt=args.prompt,
@@ -1793,11 +1796,42 @@ Examples:
             checkpoint_name=args.checkpoint_name,
             resume_from=args.resume_from
         ):
+            generated_text.append(token)
             token_count += 1
         
         generation_time = time.time() - generation_start
         
+        generation_time = time.time() - generation_start
+        
         print(f"\n{'✅ Generation complete!' if not args.quiet else ''}")
+        
+        # Show the complete generated text
+        if generated_text:
+            complete_text = "".join(generated_text)
+            full_output = f"{args.prompt}{complete_text}"
+            
+            if not args.quiet:
+                print("\n" + "="*80)
+                print("📝 COMPLETE OUTPUT:")
+                print("="*80)
+                print(f"Prompt: {args.prompt}")
+                print(f"Generated: {complete_text}")
+                print("="*80)
+            else:
+                # In quiet mode, just show the complete text
+                print(f"\nComplete output: {full_output}")
+            
+            # Save to file if requested
+            if args.output_file:
+                try:
+                    with open(args.output_file, 'w', encoding='utf-8') as f:
+                        f.write(full_output)
+                    if not args.quiet:
+                        print(f"💾 Output saved to: {args.output_file}")
+                except Exception as e:
+                    print(f"❌ Error saving to file: {e}")
+        else:
+            print("\n⚠️  No tokens were generated.")
         
         # Show final stats
         if not args.quiet:
