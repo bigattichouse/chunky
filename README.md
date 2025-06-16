@@ -2,6 +2,8 @@
 
 **Run massive language models (70B-671B parameters) on consumer GPUs with as little as 4GB VRAM through intelligent chunking and checkpoint management.**
 
+This is a work in progress. I'm still testing, but I have it at least generating tokens with the core library.
+
 > **⚠️ Testing Status**: Currently tested on Ubuntu with DeepSeek-R1 70B. Other platforms and models likely work but are untested. Performance numbers are estimates.
 
 ## 🚀 What is Chunky?
@@ -13,7 +15,7 @@ Chunky enables you to run enormous language models that normally require 140GB+ 
 - **Saving/resuming long generations** with comprehensive checkpoints
 - **Optimizing memory usage** through CPU/GPU shuttling
 
-**Example**: Run DeepSeek-R1 70B (normally needs 140GB VRAM) on a 4GB RTX 4090!
+**Example**: Run DeepSeek-R1 70B (normally needs 140GB VRAM) on a 5GB Quadro P2200!
 
 ## 📋 Requirements
 
