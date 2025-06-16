@@ -260,12 +260,14 @@ class SimpleChunkedModelWithCheckpoints:
     """Enhanced chunked model with full checkpoint support"""
     
     def __init__(self, model_path: str, max_vram_gb: float = 4.0, temperature: float = 0.7, 
-                 quiet: bool = False, chunk_layers: int = None, checkpoint_dir: str = "./checkpoints"):
+                 quiet: bool = False, chunk_layers: int = None, checkpoint_dir: str = "./checkpoints",
+                 max_context_length: int = None):
         self.model_path = model_path
         self.max_vram_gb = max_vram_gb
         self.temperature = temperature
         self.quiet = quiet
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.max_context_length = max_context_length  # User override
         
         # Checkpoint manager
         self.checkpoint_manager = CheckpointManager(checkpoint_dir)
@@ -312,6 +314,27 @@ class SimpleChunkedModelWithCheckpoints:
             
             estimated_chunks = 80 // self.max_layers_in_vram
             print(f"   Expected chunks per token: ~{estimated_chunks}")
+    
+    def estimate_context_memory(self, sequence_length: int) -> float:
+        """Estimate VRAM usage for given context length"""
+        if not hasattr(self, 'config') or self.config is None:
+            return 2.0  # Conservative fallback
+        
+        hidden_size = getattr(self.config, 'hidden_size', 4096)
+        num_heads = getattr(self.config, 'num_attention_heads', 32)
+        
+        # Hidden states memory (sequence_length * hidden_size * 2 bytes for fp16)
+        hidden_memory = sequence_length * hidden_size * 2
+        
+        # Attention matrix memory (num_heads * sequence_length^2 * 2 bytes)
+        # This is the main bottleneck for long sequences
+        attention_memory = num_heads * sequence_length * sequence_length * 2
+        
+        # Add some overhead for temporary tensors
+        overhead = 0.5 * (1024**3)  # 0.5GB overhead
+        
+        total_bytes = hidden_memory + attention_memory + overhead
+        return total_bytes / (1024**3)  # Convert to GB
     
     def get_model_config_hash(self) -> str:
         """Generate hash of model configuration for compatibility checking"""
@@ -369,7 +392,6 @@ class SimpleChunkedModelWithCheckpoints:
             average_chunk_time=np.mean(self.chunk_times) if self.chunk_times else 0.0
         )
     
-    # Include all the existing methods from SimpleChunkedModel
     def load_tokenizer_and_config(self):
         """Load tokenizer and config (lightweight)"""
         if not self.quiet:
@@ -387,6 +409,24 @@ class SimpleChunkedModelWithCheckpoints:
                 print(f"   Layers: {self.config.num_hidden_layers}")
                 print(f"   Hidden size: {self.config.hidden_size}")
                 print(f"   Vocab size: {self.config.vocab_size}")
+                
+                # Detect and set context length
+                model_max_context = getattr(self.config, 'max_position_embeddings', 
+                                          getattr(self.config, 'max_sequence_length', 4096))
+                
+                if self.max_context_length is None:
+                    self.max_context_length = model_max_context
+                    print(f"   Context length: {self.max_context_length} (model default)")
+                else:
+                    print(f"   Context length: {self.max_context_length} (user override, model supports {model_max_context})")
+                    if self.max_context_length > model_max_context:
+                        print(f"   ⚠️  Warning: Requested context ({self.max_context_length}) > model max ({model_max_context})")
+            else:
+                # Set context length even in quiet mode
+                model_max_context = getattr(self.config, 'max_position_embeddings', 
+                                          getattr(self.config, 'max_sequence_length', 4096))
+                if self.max_context_length is None:
+                    self.max_context_length = model_max_context
             
             return True
             
@@ -395,24 +435,87 @@ class SimpleChunkedModelWithCheckpoints:
                 print(f"❌ Error loading tokenizer/config: {e}")
             return False
     
+    def inspect_safetensor_keys(self):
+        """Debug method to inspect all keys in safetensor files"""
+        print("🔍 Inspecting safetensor files for available keys...")
+        
+        all_keys = set()
+        embedding_like_keys = []
+        lm_head_like_keys = []
+        
+        for file_path in self.safetensor_files:
+            try:
+                with safe_open(file_path, framework="pt") as f:
+                    file_keys = list(f.keys())
+                    all_keys.update(file_keys)
+                    
+                    # Look for embedding-like keys
+                    for key in file_keys:
+                        if any(pattern in key.lower() for pattern in ['embed', 'wte', 'word_embeddings']):
+                            embedding_like_keys.append(key)
+                        if any(pattern in key.lower() for pattern in ['lm_head', 'head', 'output']):
+                            lm_head_like_keys.append(key)
+                    
+                    print(f"   📄 {file_path.name}: {len(file_keys)} keys")
+            except Exception as e:
+                print(f"   ❌ Error reading {file_path.name}: {e}")
+        
+        print(f"\n📋 Found embedding-like keys: {embedding_like_keys}")
+        print(f"📋 Found LM head-like keys: {lm_head_like_keys}")
+        
+        # Show some sample keys for debugging
+        if all_keys:
+            sample_keys = sorted(list(all_keys))[:20]
+            print(f"\n📋 Sample keys (first 20): {sample_keys}")
+        
+        return embedding_like_keys, lm_head_like_keys
+    
     def create_memory_maps(self):
-        """Find safetensor files"""
+        """Enhanced version with better error handling and debugging"""
         if not self.quiet:
             print("🗺️  Finding model weight files...")
         
         model_dir = Path(self.model_path)
         if not model_dir.exists():
-            from huggingface_hub import snapshot_download
-            if not self.quiet:
-                print(f"   Downloading {self.model_path}...")
-            model_dir = Path(snapshot_download(self.model_path))
+            try:
+                from huggingface_hub import snapshot_download
+                if not self.quiet:
+                    print(f"   📥 Downloading {self.model_path}...")
+                model_dir = Path(snapshot_download(self.model_path))
+            except Exception as e:
+                print(f"❌ Failed to download model: {e}")
+                return False
         
+        # Look for safetensor files
         self.safetensor_files = list(model_dir.glob("*.safetensors"))
+        
         if not self.safetensor_files:
-            raise FileNotFoundError(f"No .safetensors files found in {model_dir}")
+            # Fallback: look for .bin files
+            bin_files = list(model_dir.glob("*.bin"))
+            if bin_files:
+                print(f"⚠️  No .safetensors files found, but found {len(bin_files)} .bin files")
+                print("   This script only supports .safetensors format")
+                print("   Consider converting the model to safetensors format")
+            else:
+                print("❌ No model weight files found (.safetensors or .bin)")
+            return False
         
         if not self.quiet:
-            print(f"✅ Found {len(self.safetensor_files)} model files")
+            print(f"✅ Found {len(self.safetensor_files)} model files:")
+            for f in self.safetensor_files:
+                file_size = f.stat().st_size / (1024**3)  # GB
+                print(f"   📄 {f.name} ({file_size:.1f}GB)")
+        
+        # Quick inspection of first file to see what keys are available
+        if not self.quiet and self.safetensor_files:
+            try:
+                with safe_open(self.safetensor_files[0], framework="pt") as f:
+                    sample_keys = list(f.keys())[:10]
+                    print(f"   🔍 Sample keys: {sample_keys}")
+            except Exception as e:
+                print(f"   ⚠️  Could not inspect keys: {e}")
+        
+        return True
     
     def get_layer_weights(self, layer_idx: int) -> Dict[str, torch.Tensor]:
         """Load specific layer weights from safetensor files"""
@@ -445,55 +548,183 @@ class SimpleChunkedModelWithCheckpoints:
         return layer_weights
     
     def get_embedding_weights(self) -> Optional[torch.Tensor]:
-        """Load embedding layer weights"""
+        """Enhanced embedding layer weights loading with better pattern matching"""
         if self.embedding_weights is not None:
             if self.keep_embeddings_on_cpu:
                 return self.embedding_weights.to(device=self.device, dtype=self.dtype)
             else:
                 return self.embedding_weights
         
-        embed_patterns = ["model.embed_tokens.weight", "transformer.wte.weight"]
+        # Comprehensive embedding patterns for different model architectures
+        embed_patterns = [
+            # Standard patterns
+            "model.embed_tokens.weight",
+            "embed_tokens.weight", 
+            "transformer.wte.weight",
+            "wte.weight",
+            "word_embeddings.weight",
+            "embeddings.word_embeddings.weight",
+            "model.embeddings.word_embeddings.weight",
+            
+            # Additional patterns for various architectures
+            "transformer.word_embeddings.weight",
+            "model.word_embeddings.weight",
+            "embeddings.weight",
+            "input_embeddings.weight",
+            "model.embeddings.weight",
+            "backbone.embeddings.word_embeddings.weight",
+            "language_model.embedding.word_embeddings.weight",
+            
+            # Falcon-specific
+            "transformer.word_embeddings.weight",
+            
+            # MPT-specific  
+            "transformer.wte.weight",
+            
+            # CodeGen-specific
+            "transformer.wte.weight",
+            
+            # GPT-NeoX-specific
+            "gpt_neox.embed_in.weight",
+            
+            # LLaMA variants
+            "model.embed_tokens.weight",
+            "embed_in.weight"
+        ]
+        
+        if not self.quiet:
+            print("🔍 Searching for embedding weights...")
+        
+        found_pattern = None
         
         for file_path in self.safetensor_files:
             try:
                 with safe_open(file_path, framework="pt") as f:
+                    available_keys = list(f.keys())
+                    
                     for pattern in embed_patterns:
-                        if pattern in f.keys():
+                        if pattern in available_keys:
+                            if not self.quiet:
+                                print(f"   ✅ Found embedding pattern: {pattern}")
+                            
                             tensor = f.get_tensor(pattern)
-                            if self.keep_embeddings_on_cpu:
-                                self.embedding_weights = tensor.to(dtype=self.dtype)
-                                return tensor.to(device=self.device, dtype=self.dtype)
+                            found_pattern = pattern
+                            
+                            # Validate tensor shape (should be [vocab_size, hidden_size])
+                            if len(tensor.shape) == 2:
+                                vocab_size, hidden_size = tensor.shape
+                                if not self.quiet:
+                                    print(f"   📏 Embedding shape: {tensor.shape} (vocab: {vocab_size}, hidden: {hidden_size})")
+                                
+                                if self.keep_embeddings_on_cpu:
+                                    self.embedding_weights = tensor.to(dtype=self.dtype)
+                                    return tensor.to(device=self.device, dtype=self.dtype)
+                                else:
+                                    self.embedding_weights = tensor.to(device=self.device, dtype=self.dtype)
+                                    return self.embedding_weights
                             else:
-                                self.embedding_weights = tensor.to(device=self.device, dtype=self.dtype)
-                                return self.embedding_weights
-            except Exception:
+                                if not self.quiet:
+                                    print(f"   ⚠️  Unexpected embedding shape: {tensor.shape}, skipping")
+                                continue
+                                
+            except Exception as e:
+                if not self.quiet:
+                    print(f"   ⚠️  Error reading {file_path.name}: {e}")
                 continue
+        
+        # If no embedding weights found, inspect available keys for debugging
+        if not found_pattern:
+            if not self.quiet:
+                print("❌ No embedding weights found with standard patterns")
+                embedding_keys, _ = self.inspect_safetensor_keys()
+                if embedding_keys:
+                    print(f"🤔 Found these embedding-like keys: {embedding_keys}")
+                    print("   You may need to add these patterns to the search list")
+                else:
+                    print("🤔 No embedding-like keys found at all")
+                    print("   This might be a different model format or architecture")
+        
         return None
     
     def get_lm_head_weights(self) -> Optional[torch.Tensor]:
-        """Load language modeling head weights"""
+        """Enhanced LM head weights loading with better pattern matching"""
         if self.lm_head_weights is not None:
             if self.keep_embeddings_on_cpu:
                 return self.lm_head_weights.to(device=self.device, dtype=self.dtype)
             else:
                 return self.lm_head_weights
         
-        lm_head_patterns = ["lm_head.weight", "transformer.wte.weight", "model.embed_tokens.weight"]
+        # Comprehensive LM head patterns
+        lm_head_patterns = [
+            # Standard patterns
+            "lm_head.weight",
+            "model.lm_head.weight",
+            
+            # Shared embedding patterns (often LM head uses same weights as embeddings)
+            "model.embed_tokens.weight",
+            "embed_tokens.weight",
+            "transformer.wte.weight", 
+            "wte.weight",
+            "word_embeddings.weight",
+            
+            # Other output layer patterns
+            "output.weight",
+            "model.output.weight",
+            "transformer.ln_f.weight",  # Sometimes the final layer norm
+            "head.weight",
+            "classifier.weight",
+            "output_layer.weight",
+            
+            # Architecture-specific patterns
+            "gpt_neox.embed_out.weight",
+            "transformer.head.weight",
+            "language_model.lm_head.weight",
+            "model.language_model.lm_head.weight"
+        ]
+        
+        if not self.quiet:
+            print("🔍 Searching for LM head weights...")
         
         for file_path in self.safetensor_files:
             try:
                 with safe_open(file_path, framework="pt") as f:
+                    available_keys = list(f.keys())
+                    
                     for pattern in lm_head_patterns:
-                        if pattern in f.keys():
+                        if pattern in available_keys:
+                            if not self.quiet:
+                                print(f"   ✅ Found LM head pattern: {pattern}")
+                            
                             tensor = f.get_tensor(pattern)
-                            if self.keep_embeddings_on_cpu:
-                                self.lm_head_weights = tensor.to(dtype=self.dtype)
-                                return tensor.to(device=self.device, dtype=self.dtype)
+                            
+                            # Validate tensor shape (should be [vocab_size, hidden_size] or [hidden_size, vocab_size])
+                            if len(tensor.shape) == 2:
+                                dim1, dim2 = tensor.shape
+                                if not self.quiet:
+                                    print(f"   📏 LM head shape: {tensor.shape}")
+                                
+                                if self.keep_embeddings_on_cpu:
+                                    self.lm_head_weights = tensor.to(dtype=self.dtype)
+                                    return tensor.to(device=self.device, dtype=self.dtype)
+                                else:
+                                    self.lm_head_weights = tensor.to(device=self.device, dtype=self.dtype)
+                                    return self.lm_head_weights
                             else:
-                                self.lm_head_weights = tensor.to(device=self.device, dtype=self.dtype)
-                                return self.lm_head_weights
-            except Exception:
+                                if not self.quiet:
+                                    print(f"   ⚠️  Unexpected LM head shape: {tensor.shape}, skipping")
+                                continue
+                                
+            except Exception as e:
+                if not self.quiet:
+                    print(f"   ⚠️  Error reading {file_path.name}: {e}")
                 continue
+        
+        if not self.quiet:
+            print("❌ No LM head weights found")
+            _, lm_head_keys = self.inspect_safetensor_keys()
+            if lm_head_keys:
+                print(f"🤔 Found these LM head-like keys: {lm_head_keys}")
+        
         return None
     
     def get_vram_usage(self) -> float:
@@ -678,6 +909,31 @@ class SimpleChunkedModelWithCheckpoints:
         
         return current_states
     
+    def debug_model_architecture(self):
+        """Debug method to understand the model architecture"""
+        if not self.quiet:
+            print("\n🔬 Model Architecture Analysis:")
+            print(f"   Model path: {self.model_path}")
+            if self.config:
+                print(f"   Model type: {getattr(self.config, 'model_type', 'unknown')}")
+                print(f"   Architecture: {getattr(self.config, 'architectures', 'unknown')}")
+                print(f"   Layers: {getattr(self.config, 'num_hidden_layers', 'unknown')}")
+                print(f"   Hidden size: {getattr(self.config, 'hidden_size', 'unknown')}")
+                print(f"   Vocab size: {getattr(self.config, 'vocab_size', 'unknown')}")
+                print(f"   Attention heads: {getattr(self.config, 'num_attention_heads', 'unknown')}")
+            
+            # Inspect the actual file structure
+            if hasattr(self, 'safetensor_files') and self.safetensor_files:
+                embedding_keys, lm_head_keys = self.inspect_safetensor_keys()
+                
+                if not embedding_keys and not lm_head_keys:
+                    print("\n❌ Critical: No embedding or LM head weights found!")
+                    print("   This suggests either:")
+                    print("   1. The model uses a different naming convention")
+                    print("   2. The model is in a different format")
+                    print("   3. The files are corrupted")
+                    print("\n💡 Try running with --quiet False to see all available keys")
+    
     def generate_chunked_with_checkpoints(self, prompt: str = None, max_tokens: int = 50,
                                         checkpoint_every: int = 10, checkpoint_name: str = None,
                                         resume_from: str = None) -> Generator[str, None, None]:
@@ -701,7 +957,7 @@ class SimpleChunkedModelWithCheckpoints:
             generated_tokens = checkpoint.generated_tokens
             start_token = checkpoint.current_token_count
             max_tokens = checkpoint.target_token_count  # Use original target
-            hidden_states = hidden_states.to(self.device)
+            hidden_states = hidden_states.to(self.device)  # Ensure on correct device
             
             # Restore RNG state for reproducibility
             if checkpoint.torch_rng_state:
@@ -726,16 +982,13 @@ class SimpleChunkedModelWithCheckpoints:
                 print(f"🎯 Starting new generation: '{prompt[:50]}...'")
             
             # Tokenize and embed
-            #inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(self.device)
-            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=False)
-            if inputs["input_ids"].shape[1] > 4000:  # Use model's actual limit
-                print(f"⚠️  Input too long, truncating to 4000 tokens")
-                inputs["input_ids"] = inputs["input_ids"][:, -4000:]
-            
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(self.device)
             input_ids = inputs["input_ids"]
             
             embed_weights = self.get_embedding_weights()
             if embed_weights is None:
+                # Try to debug what's available
+                self.debug_model_architecture()
                 raise RuntimeError("Could not load embedding weights")
             
             hidden_states = F.embedding(input_ids, embed_weights).to(self.dtype)
@@ -802,6 +1055,10 @@ class SimpleChunkedModelWithCheckpoints:
                 lm_head_weights = self.get_embedding_weights()
             
             if lm_head_weights is not None:
+                # Ensure LM head weights are on same device as hidden states
+                if lm_head_weights.device != hidden_states.device:
+                    lm_head_weights = lm_head_weights.to(hidden_states.device)
+                
                 last_hidden = hidden_states[:, -1, :]
                 logits = F.linear(last_hidden, lm_head_weights)
                 
@@ -867,10 +1124,12 @@ def main():
     parser.add_argument("--model", required=True, help="Model path or HuggingFace model name")
     parser.add_argument("--vram", type=float, default=4.0, help="Max VRAM in GB")
     parser.add_argument("--prompt", default="The future of AI is", help="Generation prompt")
+    parser.add_argument("--file", help="Read prompt from file (overrides --prompt)")
     parser.add_argument("--tokens", type=int, default=20, help="Tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.7, help="Generation temperature")
     parser.add_argument("--quiet", action="store_true", help="Hide initialization messages")
     parser.add_argument("--chunk-layers", type=int, help="Layers per chunk")
+    parser.add_argument("--max-context", type=int, help="Maximum context length (default: use model's max)")
     
     # Checkpoint arguments
     parser.add_argument("--checkpoint-every", type=int, default=10, help="Save checkpoint every N tokens")
@@ -881,6 +1140,30 @@ def main():
     parser.add_argument("--cleanup-checkpoints", action="store_true", help="Remove old checkpoint files")
     
     args = parser.parse_args()
+    
+    # Handle file input for prompt
+    if args.file:
+        try:
+            with open(args.file, 'r', encoding='utf-8') as f:
+                file_prompt = f.read()
+            
+            if not args.quiet:
+                file_size_kb = len(file_prompt.encode('utf-8')) / 1024
+                print(f"📁 Reading prompt from: {args.file}")
+                print(f"   File size: {file_size_kb:.1f}KB ({len(file_prompt)} characters)")
+            
+            args.prompt = file_prompt
+            
+        except FileNotFoundError:
+            print(f"❌ Error: File not found: {args.file}")
+            return
+        except UnicodeDecodeError:
+            print(f"❌ Error: Could not read file {args.file} (encoding issue)")
+            print("   Try saving the file as UTF-8")
+            return
+        except Exception as e:
+            print(f"❌ Error reading file {args.file}: {e}")
+            return
     
     # Handle checkpoint management commands
     if args.list_checkpoints:
@@ -896,7 +1179,7 @@ def main():
     # Create model
     model = SimpleChunkedModelWithCheckpoints(
         args.model, args.vram, args.temperature, args.quiet, 
-        args.chunk_layers, args.checkpoint_dir
+        args.chunk_layers, args.checkpoint_dir, args.max_context
     )
     
     try:
@@ -905,7 +1188,9 @@ def main():
             print("❌ Failed to load tokenizer/config")
             return
         
-        model.create_memory_maps()
+        if not model.create_memory_maps():
+            print("❌ Failed to create memory maps")
+            return
         
         # Generate with checkpoints
         if not args.quiet:

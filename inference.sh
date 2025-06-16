@@ -8,5 +8,6 @@ python chunky.py \
   --prompt "Write a linux commandline tetris program in C." \
   --tokens 1000 \
   --checkpoint-every 25 \
+  --max-context 1024 \
   --checkpoint-name quantum_essay \
   --quiet
